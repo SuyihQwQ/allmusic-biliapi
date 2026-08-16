@@ -1,0 +1,25 @@
+# Build artifacts
+*.class
+*.jar
+out/
+out2/
+out3/
+out4/
+build/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.settings/
+.classpath
+.project
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Minecraft server data
+music_cache/
+*.mp3
+*.mp4
