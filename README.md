@@ -14,19 +14,86 @@
 
 ## 架构
 
+```mermaid
+graph TB
+    subgraph Client["🎮 玩家客户端"]
+        A["Fabric + AllMusic_Client"]
+    end
+
+    subgraph Server["🖥️ Paper 服务器"]
+        B["AllMusic 插件"]
+        C["BiliMusicApi<br/>(自研 B 站音乐源)"]
+        D["ffmpeg 转码<br/>MP4 → MP3"]
+    end
+
+    subgraph Bilibili["📺 B 站 API"]
+        E["搜索 API"]
+        F["视频解析 API"]
+        G["视频下载 durl"]
+    end
+
+    subgraph ReverseProxy["🔄 反向代理"]
+        H["Caddy (443)"]
+        I["Python http.server (8090)"]
+    end
+
+    subgraph Storage["💾 存储"]
+        J["music_cache/*.mp3"]
+    end
+
+    A -->|"/music search 歌名"| B
+    B --> C
+    C -->|1. 调用搜索/解析<br/>带 UA + Referer| E
+    C -->|2. 获取视频信息| F
+    C -->|3. 下载混合 MP4<br/>~10MB, 6s| G
+    C -->|4. 转码| D
+    D -->|存入缓存| J
+    C -->|5. 返回 URL| H
+    H -->|handle_path /music/*| I
+    I -->|静态文件服务| J
+    A -->|6. 请求音频流<br/>HTTPS| H
+    H -->|7. 返回 MP3| A
+
+    style Client fill:#e1f5fe
+    style Server fill:#f3e5f5
+    style Bilibili fill:#fff3e0
+    style ReverseProxy fill:#e8f5e9
+    style Storage fill:#fce4ec
 ```
-玩家客户端 (Fabric + AllMusic_Client)
-   │  /music search 晴天
-   ▼
-Paper 服务器 (AllMusic + BiliMusicApi)
-   │  1. 调 B站搜索/解析 API（带 UA + Referer）
-   │  2. 下载 durl 混合 MP4（~10MB，6秒）
-   │  3. ffmpeg 转 MP3（~3MB，6秒）→ 存缓存目录
-   │  4. 返回 https://域名/music/<bvid>.mp3
-   ▼
-Caddy (443) ──handle_path /music/*──▶ Python http.server (8090)
-                                        └─ music_cache/*.mp3
+
+<details>
+<summary>📊 简化流程图</summary>
+
+```mermaid
+sequenceDiagram
+    participant P as 玩家客户端
+    participant S as Paper 服务器
+    participant B as B 站 API
+    participant F as ffmpeg
+    participant C as Caddy/HTTP
+
+    P->>S: /music search 晴天
+    S->>B: 搜索视频
+    B-->>S: 视频列表
+    S-->>P: 显示搜索结果
+
+    P->>S: /music 1
+    S->>B: 解析视频地址
+    B-->>S: durl 混合 MP4
+    S->>B: 下载 MP4 (~10MB)
+    B-->>S: MP4 数据
+    S->>F: 转码 MP4 → MP3
+    F-->>S: MP3 文件 (~3MB)
+    S->>S: 存入缓存目录
+    S-->>P: 返回 https://域名/music/bvid.mp3
+
+    P->>C: 请求音频流
+    C->>C: 读取缓存 MP3
+    C-->>P: 返回 MP3 数据流
+    P->>P: 播放音乐 🎵
 ```
+
+</details>
 
 **关键决策**：
 - **为什么不用 DASH 纯音频**：B 站对数据中心 IP 的 DASH 接口限流（和网易云 weapi 一样），试了 `fnval=16/80/4048`、带 cookie、各种 UA 都拿不到 `audio`，只稳定返回 durl 混合 MP4
@@ -36,6 +103,36 @@ Caddy (443) ──handle_path /music/*──▶ Python http.server (8090)
 ---
 
 ## 项目结构
+
+```mermaid
+graph LR
+    subgraph Root["📁 allmusic-bilibili"]
+        direction TB
+        subgraph Server["server/"]
+            A["src/main/java/bili/<br/>BiliMusicApi.java<br/>🎯 核心：B 站音乐源"]
+            subgraph Scripts["scripts/"]
+                B["music_server.py<br/>🌐 HTTP 服务 (8090)"]
+                C["Caddyfile<br/>⚙️ 反代配置"]
+            end
+        end
+        subgraph Client["client-patch/"]
+            D["AllMusicPlayer.java<br/>🔧 ftyp/skip/seek 修复"]
+            E["AllMusicCore.java<br/>🔧 禁用系统代理"]
+        end
+        subgraph Docs["docs/"]
+            F["TROUBLESHOOTING.md<br/>📝 踩坑记录"]
+        end
+    end
+
+    A --> B
+    A --> C
+    D --> E
+
+    style Server fill:#f3e5f5
+    style Client fill:#e1f5fe
+    style Docs fill:#e8f5e9
+    style Scripts fill:#fff3e0
+```
 
 ```
 allmusic-bilibili/
