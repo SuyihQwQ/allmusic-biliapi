@@ -108,20 +108,20 @@ sequenceDiagram
 ```
 allmusic-bilibili/
 ├── docs
-│   └── config.md
+│   └── config.md
 ├── LICENSE
 ├── README.md
 └── server
-├── scripts
-│   ├── Caddyfile
-│   └── music_server.py
-└── src
-├── main
-│   └── java
-│       └── bili
-│           └── BiliMusicApi.java
-└── resources
-└── version
+    ├── scripts
+    │   ├── Caddyfile
+    │   └── music_server.py
+    └── src
+        └── main
+            ├── java
+            │   └── bili
+            │       └── BiliMusicApi.java
+            └── resources
+                └── version
 ```
 
 ## 部署步骤
