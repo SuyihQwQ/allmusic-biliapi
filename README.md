@@ -1,4 +1,5 @@
 # AllMusic Bilibili 音乐源
+# Windows用户请仔细查看配置介绍！！！！！！
 
 让 [AllMusic](https://github.com/Coloryr/AllMusic) 插件支持 **Bilibili 视频点歌** 的完整解决方案。
 
