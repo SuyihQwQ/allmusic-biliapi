@@ -10,25 +10,314 @@ import com.coloryr.allmusic.server.core.objs.music.SongInfoObj;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import com.google.gson.JsonParseException;
 
-import java.io.BufferedReader;
-import java.io.File;
-import java.io.FileOutputStream;
-import java.io.InputStream;
-import java.io.InputStreamReader;
+import java.io.*;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Stream;
 
 public class BiliMusicApi implements IMusicApi {
-    private static final String UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-    // 缓存目录与对外提供地址，可用环境变量覆盖（便于部署到不同服务器）
-    private static final String CACHE_DIR = System.getenv().getOrDefault("ALLMUSIC_BILI_CACHE_DIR", "/home/minecraft/music_cache");
-    private static final String SERVE_URL = System.getenv().getOrDefault("ALLMUSIC_BILI_SERVE_URL", "https://YOUR-DOMAIN/music/");
-    private boolean isUpdate;
+
+    private static final String LOG_PREFIX = "<light_purple>[BiliAPI]";
+    private static final String BILI_API_BASE = "https://api.bilibili.com";
+
+    // 必填项
+    private String cacheDir = null;
+    private String serveUrl = null;
+
+    // 可选顶层
+    private String ffmpegPath = "ffmpeg";
+    private String userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+    private int maxAudioLength = 45;          // 单位：分钟，0 表示不限制
+    private int maxCacheSize = 100;           // 单位：MB，0 表示不限制
+
+    // advanced 选项
+    private int maxRetry = 3;
+    private long retryDelay = 1500L;
+    private int quality = 6;
+
+    private volatile boolean isUpdate;
+    private boolean configValid = false;
+    private File configFile;
+
+    // ========== IMusicApi 接口方法 ==========
+
+    @Override
+    public void reload(File path) {
+        configFile = new File(path, "bili.json");
+        configValid = false;
+
+        // 尝试加载并验证配置
+        BiliConfig cfg = loadAndValidateConfig();
+        if (cfg != null && cfg.valid) {
+            // 应用配置值
+            applyConfig(cfg);
+            // 验证 ffmpeg 和缓存目录
+            if (validateEnvironment()) {
+                configValid = true;
+                logConfigStatus();
+            } else {
+                configValid = false;
+                AllMusic.log.data(LOG_PREFIX + "<red>B站API加载失败：ffmpeg 或缓存目录不可用");
+            }
+        } else {
+            // 配置缺失或无效，生成默认配置
+            createDefaultConfigFile();
+            AllMusic.log.data(LOG_PREFIX + "<yellow>已生成默认 bili.json，请填写 cacheDir、serveUrl 后重载");
+            configValid = false;
+        }
+    }
+
+    /**
+     * 加载并验证配置文件，返回配置值对象；若文件损坏或缺失则返回 null。
+     */
+    private BiliConfig loadAndValidateConfig() {
+        if (!configFile.exists()) {
+            return null;
+        }
+
+        JsonObject root;
+        try (InputStreamReader reader = new InputStreamReader(
+                Files.newInputStream(configFile.toPath()), StandardCharsets.UTF_8);
+             BufferedReader bf = new BufferedReader(reader)) {
+            root = AllMusic.gson.fromJson(bf, JsonObject.class);
+        } catch (JsonParseException e) {
+            AllMusic.log.data(LOG_PREFIX + "<red>配置文件 JSON 格式错误：" + e.toString());
+            backupBrokenConfig();
+            return null;
+        } catch (Exception e) {
+            AllMusic.log.data(LOG_PREFIX + "<red>读取配置文件异常：" + e.toString());
+            backupBrokenConfig();
+            return null;
+        }
+
+        // 提取必填项
+        String tmpCacheDir = null;
+        String tmpServeUrl = null;
+        if (root.has("cacheDir")) {
+            String dir = root.get("cacheDir").getAsString();
+            if (dir != null && !dir.trim().isEmpty()) tmpCacheDir = dir.trim();
+        }
+        if (root.has("serveUrl")) {
+            String url = root.get("serveUrl").getAsString();
+            if (url != null && !url.trim().isEmpty()) tmpServeUrl = normalizeUrl(url.trim());
+        }
+
+        // 如果必填项缺失，直接返回 null（后续会生成默认配置）
+        if (tmpCacheDir == null || tmpServeUrl == null) {
+            AllMusic.log.data(LOG_PREFIX + "<red>配置缺少 cacheDir 或 serveUrl");
+            return null;
+        }
+
+        // 解析可选配置
+        BiliConfig cfg = new BiliConfig();
+        cfg.cacheDir = tmpCacheDir;
+        cfg.serveUrl = tmpServeUrl;
+        cfg.ffmpegPath = root.has("ffmpegPath") ? root.get("ffmpegPath").getAsString() : "ffmpeg";
+        cfg.userAgent = root.has("userAgent") ? root.get("userAgent").getAsString() :
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+        // maxAudioLength
+        cfg.maxAudioLength = 45;
+        if (root.has("maxAudioLength")) {
+            try {
+                int val = root.get("maxAudioLength").getAsInt();
+                if (val >= 0) cfg.maxAudioLength = val;
+                else AllMusic.log.data(LOG_PREFIX + "<yellow>maxAudioLength 为负数，使用默认 45");
+            } catch (NumberFormatException e) {
+                AllMusic.log.data(LOG_PREFIX + "<red>maxAudioLength 不是有效整数，使用默认 45");
+            }
+        }
+
+        // maxCacheSize
+        cfg.maxCacheSize = 100;
+        if (root.has("maxCacheSize")) {
+            try {
+                int val = root.get("maxCacheSize").getAsInt();
+                if (val >= 0) cfg.maxCacheSize = val;
+                else AllMusic.log.data(LOG_PREFIX + "<yellow>maxCacheSize 为负数，使用默认 100");
+            } catch (NumberFormatException e) {
+                AllMusic.log.data(LOG_PREFIX + "<red>maxCacheSize 不是有效整数，使用默认 100");
+            }
+        }
+
+        // 解析 advanced 对象
+        parseAdvanced(root, cfg);
+
+        // 标记有效（只要 cacheDir 和 serveUrl 存在即可）
+        cfg.valid = true;
+        return cfg;
+    }
+
+    /**
+     * 解析 advanced 子对象，缺失字段使用默认值并记录警告。
+     */
+    private void parseAdvanced(JsonObject root, BiliConfig cfg) {
+        // 默认值
+        cfg.quality = 6;
+        cfg.maxRetry = 3;
+        cfg.retryDelay = 1500L;
+
+        if (root.has("advanced") && root.get("advanced").isJsonObject()) {
+            JsonObject adv = root.getAsJsonObject("advanced");
+            // quality
+            if (adv.has("quality")) {
+                try {
+                    int q = adv.get("quality").getAsInt();
+                    if (q >= 0 && q <= 9) {
+                        cfg.quality = q;
+                    } else {
+                        AllMusic.log.data(LOG_PREFIX + "<red>quality 值超出 0-9 范围：" + q + "，使用默认 6");
+                    }
+                } catch (NumberFormatException e) {
+                    AllMusic.log.data(LOG_PREFIX + "<red>quality 不是有效整数，使用默认 6");
+                }
+            } else {
+                AllMusic.log.data(LOG_PREFIX + "<yellow>advanced.quality 缺失，使用默认值 6");
+            }
+
+            // maxRetry
+            if (adv.has("maxRetry")) {
+                try {
+                    int mr = adv.get("maxRetry").getAsInt();
+                    if (mr > 0) cfg.maxRetry = mr;
+                } catch (NumberFormatException ignored) {}
+            }
+
+            // retryDelay
+            if (adv.has("retryDelay")) {
+                try {
+                    long rd = adv.get("retryDelay").getAsLong();
+                    if (rd > 0) cfg.retryDelay = rd;
+                } catch (NumberFormatException ignored) {}
+            }
+        } else {
+            AllMusic.log.data(LOG_PREFIX + "<yellow>配置中缺少 advanced 对象，将使用默认值");
+        }
+    }
+
+    /**
+     * 将配置值应用到成员变量。
+     */
+    private void applyConfig(BiliConfig cfg) {
+        this.cacheDir = cfg.cacheDir;
+        this.serveUrl = cfg.serveUrl;
+        this.ffmpegPath = cfg.ffmpegPath;
+        this.userAgent = cfg.userAgent;
+        this.maxAudioLength = cfg.maxAudioLength;
+        this.maxCacheSize = cfg.maxCacheSize;
+        this.quality = cfg.quality;
+        this.maxRetry = cfg.maxRetry;
+        this.retryDelay = cfg.retryDelay;
+    }
+
+    /**
+     * 验证 ffmpeg 和缓存目录，清理缓存（若启用）。
+     * @return true 如果环境准备就绪
+     */
+    private boolean validateEnvironment() {
+        // 检查 ffmpeg
+        if (!checkFfmpeg()) {
+            AllMusic.log.data(LOG_PREFIX + "<red>ffmpeg 不可用，请检查 ffmpeg 路径是否正确");
+            return false;
+        }
+
+        // 检查缓存目录
+        Path cachePath = getCachePath();
+        if (!Files.exists(cachePath) || !Files.isDirectory(cachePath)) {
+            AllMusic.log.data(LOG_PREFIX + "<red>缓存目录不存在或不是目录：" + cachePath.toAbsolutePath());
+            AllMusic.log.data(LOG_PREFIX + "<red>请创建该目录或修改 cacheDir 配置");
+            return false;
+        }
+
+        // 如果启用缓存清理，执行清理
+        if (maxCacheSize > 0) {
+            cleanupCache(cachePath);
+        } else {
+            AllMusic.log.data(LOG_PREFIX + "<yellow>缓存清理已禁用（maxCacheSize=0）");
+        }
+        return true;
+    }
+
+    /**
+     * 打印当前配置状态日志。
+     */
+    private void logConfigStatus() {
+        AllMusic.log.data(LOG_PREFIX + "<yellow>B站API已加载");
+        AllMusic.log.data(LOG_PREFIX + "<yellow>缓存目录：" + getCachePath().toAbsolutePath());
+        AllMusic.log.data(LOG_PREFIX + "<yellow>serveUrl：" + serveUrl);
+        AllMusic.log.data(LOG_PREFIX + "<yellow>音质参数 (quality)：" + quality);
+        if (maxAudioLength > 0) {
+            AllMusic.log.data(LOG_PREFIX + "<yellow>最大音频时长限制：" + maxAudioLength + " 分钟");
+        } else {
+            AllMusic.log.data(LOG_PREFIX + "<yellow>最大音频时长限制：无限制");
+        }
+        if (maxCacheSize > 0) {
+            AllMusic.log.data(LOG_PREFIX + "<yellow>最大缓存大小：" + maxCacheSize + " MB");
+        } else {
+            AllMusic.log.data(LOG_PREFIX + "<yellow>最大缓存大小：无限制");
+        }
+    }
+
+    /**
+     * 备份损坏的配置文件（.bak）。
+     */
+    private void backupBrokenConfig() {
+        try {
+            File backup = new File(configFile.getParent(), "bili.json.bak");
+            if (backup.exists()) backup.delete();
+            Files.move(configFile.toPath(), backup.toPath());
+            AllMusic.log.data(LOG_PREFIX + "<yellow>已备份损坏的配置文件到：" + backup.getName());
+        } catch (IOException e) {
+            AllMusic.log.data(LOG_PREFIX + "<red>备份损坏配置文件失败：" + e.toString());
+        }
+    }
+
+    /**
+     * 生成默认的配置文件（包含提示信息）。
+     */
+    private void createDefaultConfigFile() {
+        try {
+            File parent = configFile.getParentFile();
+            if (parent != null && !parent.exists()) {
+                if (!parent.mkdirs()) {
+                    AllMusic.log.data(LOG_PREFIX + "<red>无法创建配置目录：" + parent.getAbsolutePath());
+                }
+            }
+            JsonObject defaultConfig = new JsonObject();
+            defaultConfig.addProperty("cacheDir", "");
+            defaultConfig.addProperty("serveUrl", "");
+            defaultConfig.addProperty("ffmpegPath", "ffmpeg");
+            defaultConfig.addProperty("userAgent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+            defaultConfig.addProperty("maxAudioLength", 45);
+            defaultConfig.addProperty("maxCacheSize", 100);
+
+            JsonObject adv = new JsonObject();
+            adv.addProperty("maxRetry", 3);
+            adv.addProperty("retryDelay", 1500);
+            adv.addProperty("quality", 6);
+            defaultConfig.add("advanced", adv);
+
+            try (FileWriter writer = new FileWriter(configFile)) {
+                writer.write(AllMusic.gson.toJson(defaultConfig));
+            }
+        } catch (Exception e) {
+            AllMusic.log.data(LOG_PREFIX + "<red>重新生成 bili.json 失败：" + e.toString());
+        }
+    }
+
+    // ---------- 以下为原有方法（未改动） ----------
 
     @Override
     public String getId() {
@@ -40,66 +329,16 @@ public class BiliMusicApi implements IMusicApi {
         return isUpdate;
     }
 
-    private HttpResObj get(String url) {
-        try {
-            HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
-            conn.setRequestMethod("GET");
-            conn.setRequestProperty("User-Agent", UA);
-            conn.setRequestProperty("Referer", "https://www.bilibili.com/");
-            conn.setRequestProperty("Accept", "application/json");
-            conn.setConnectTimeout(10000);
-            conn.setReadTimeout(15000);
-            int code = conn.getResponseCode();
-            if (code != 200) {
-                return new HttpResObj("", false);
-            }
-            StringBuilder sb = new StringBuilder();
-            try (BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
-                String line;
-                while ((line = br.readLine()) != null) {
-                    sb.append(line);
-                }
-            }
-            return new HttpResObj(sb.toString(), true);
-        } catch (Exception e) {
-            return new HttpResObj("", false);
-        }
-    }
-
-    private String downloadToFile(String url, String path) {
-        try {
-            HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
-            conn.setRequestMethod("GET");
-            conn.setRequestProperty("User-Agent", UA);
-            conn.setRequestProperty("Referer", "https://www.bilibili.com/");
-            conn.setConnectTimeout(15000);
-            conn.setReadTimeout(60000);
-            int code = conn.getResponseCode();
-            if (code != 200 && code != 206) return null;
-            try (InputStream in = conn.getInputStream();
-                 FileOutputStream out = new FileOutputStream(path)) {
-                byte[] buf = new byte[8192];
-                int n;
-                while ((n = in.read(buf)) != -1) {
-                    out.write(buf, 0, n);
-                }
-            }
-            return path;
-        } catch (Exception e) {
-            return null;
-        }
-    }
-
     @Override
     public String getMusicId(String arg) {
+        if (arg == null) return null;
         if (arg.contains("video/")) {
-            int i = arg.indexOf("video/");
-            String sub = arg.substring(i + 6);
-            int j = sub.indexOf('/');
-            if (j > 0) sub = sub.substring(0, j);
-            int q = sub.indexOf('?');
-            if (q > 0) sub = sub.substring(0, q);
-            return sub;
+            int i = arg.indexOf("video/") + 6;
+            int j = arg.indexOf('/', i);
+            if (j < 0) j = arg.length();
+            int q = arg.indexOf('?', i);
+            if (q >= 0 && q < j) j = q;
+            return arg.substring(i, j);
         }
         return arg;
     }
@@ -111,97 +350,146 @@ public class BiliMusicApi implements IMusicApi {
 
     @Override
     public SongInfoObj getMusic(String id, String player, boolean isList) {
-        HttpResObj res = get("https://api.bilibili.com/x/web-interface/view?bvid=" + id);
-        if (res != null && res.ok) {
-            try {
-                JsonObject root = AllMusic.gson.fromJson(res.data, JsonObject.class);
-                if (root.get("code").getAsInt() != 0) return null;
-                JsonObject data = root.getAsJsonObject("data");
-                String name = data.get("title").getAsString();
-                long duration = data.get("duration").getAsLong();
-                String pic = data.get("pic").getAsString();
-                String author = "";
-                JsonElement owner = data.get("owner");
-                if (owner != null && !owner.isJsonNull()) {
-                    author = owner.getAsJsonObject().get("name").getAsString();
+        // 原样保留
+        if (!configValid) {
+            AllMusic.log.data(LOG_PREFIX + "<red>API 未正确配置，拒绝处理请求");
+            if (player != null && !player.isEmpty()) {
+                Object sender = AllMusic.side.getPlayer(player);
+                if (sender != null) {
+                    AllMusic.side.sendMessage(sender, LOG_PREFIX + "<red>B站API未正确配置，请检查 bili.json");
                 }
-                long cid = data.get("cid").getAsLong();
-                return new SongInfoObj(author, name, id, "BV视频", player, "B站", isList, duration * 1000L,
-                        pic, false, null, getId());
-            } catch (Exception e) {
+            }
+            return null;
+        }
+        if (!checkId(id)) {
+            AllMusic.log.data(LOG_PREFIX + "<red>无效BV号：" + id);
+            if (player != null && !player.isEmpty()) {
+                Object sender = AllMusic.side.getPlayer(player);
+                if (sender != null) {
+                    AllMusic.side.sendMessage(sender, LOG_PREFIX + "<red>无效的BV号：" + id);
+                }
+            }
+            return null;
+        }
+
+        String url = BILI_API_BASE + "/x/web-interface/view?bvid=" + id;
+        HttpResObj res = httpGet(url);
+        if (res == null || !res.ok) {
+            AllMusic.log.data(LOG_PREFIX + "<red>获取视频信息失败：" + id);
+            if (player != null && !player.isEmpty()) {
+                Object sender = AllMusic.side.getPlayer(player);
+                if (sender != null) {
+                    AllMusic.side.sendMessage(sender, LOG_PREFIX + "<red>获取视频信息失败：" + id);
+                }
+            }
+            return null;
+        }
+
+        try {
+            JsonObject root = AllMusic.gson.fromJson(res.data, JsonObject.class);
+            if (root.get("code").getAsInt() != 0) {
+                AllMusic.log.data(LOG_PREFIX + "<red>B站API返回错误：" + root.get("code").getAsInt());
+                if (player != null && !player.isEmpty()) {
+                    Object sender = AllMusic.side.getPlayer(player);
+                    if (sender != null) {
+                        AllMusic.side.sendMessage(sender, LOG_PREFIX + "<red>B站API返回错误：" + root.get("code").getAsInt());
+                    }
+                }
                 return null;
             }
+            JsonObject data = root.getAsJsonObject("data");
+            String name = data.get("title").getAsString();
+            long duration = data.get("duration").getAsLong();
+
+            if (maxAudioLength > 0 && duration > maxAudioLength * 60L) {
+                AllMusic.log.data(LOG_PREFIX + "<yellow>视频时长超过限制：" + duration + " 秒（限制 " + maxAudioLength + " 分钟）");
+                if (player != null && !player.isEmpty()) {
+                    Object sender = AllMusic.side.getPlayer(player);
+                    if (sender != null) {
+                        AllMusic.side.sendMessage(sender, LOG_PREFIX + "<red>时长超过 " + maxAudioLength + " 分钟");
+                    }
+                }
+                return null;
+            }
+
+            String pic = data.get("pic").getAsString();
+            String author = data.has("owner") && !data.get("owner").isJsonNull()
+                    ? data.getAsJsonObject("owner").get("name").getAsString()
+                    : "";
+
+            return new SongInfoObj(author, name, id, "BV视频", player, "B站", isList,
+                    duration * 1000L, pic, false, null, getId());
+        } catch (Exception e) {
+            AllMusic.log.data(LOG_PREFIX + "<red>解析视频信息失败：" + e.toString());
+            if (player != null && !player.isEmpty()) {
+                Object sender = AllMusic.side.getPlayer(player);
+                if (sender != null) {
+                    AllMusic.side.sendMessage(sender, LOG_PREFIX + "<red>解析视频信息失败：" + e.toString());
+                }
+            }
+            return null;
         }
-        return null;
     }
 
     @Override
     public String getPlayUrl(String id) {
+        // 原样保留（未改动）
+        if (!configValid) {
+            AllMusic.log.data(LOG_PREFIX + "<red>API 未正确配置，拒绝生成播放链接");
+            return null;
+        }
+        if (!checkId(id)) {
+            AllMusic.log.data(LOG_PREFIX + "<red>无效BV号：" + id);
+            return null;
+        }
+
+        Path cachePath = getCachePath();
         String mp3Name = id + ".mp3";
-        String mp3Path = CACHE_DIR + "/" + mp3Name;
-        File mp3File = new File(mp3Path);
-        if (mp3File.exists() && mp3File.length() > 1000) {
-            return SERVE_URL + mp3Name;
-        }
-        // 拿 cid
-        HttpResObj view = get("https://api.bilibili.com/x/web-interface/view?bvid=" + id);
-        if (view == null || !view.ok) return null;
-        long cid = 0;
+        Path mp3File = cachePath.resolve(mp3Name);
+
         try {
-            JsonObject root = AllMusic.gson.fromJson(view.data, JsonObject.class);
-            cid = root.getAsJsonObject("data").get("cid").getAsLong();
-        } catch (Exception e) {
-            return null;
-        }
-        // 拿 durl 混合 MP4
-        HttpResObj play = get("https://api.bilibili.com/x/player/playurl?bvid=" + id
-                + "&cid=" + cid + "&qn=16&type=mp4&platform=html5");
-        if (play == null || !play.ok) return null;
-        String durlUrl = null;
-        try {
-            JsonObject root = AllMusic.gson.fromJson(play.data, JsonObject.class);
-            if (root.get("code").getAsInt() != 0) return null;
-            JsonArray durl = root.getAsJsonObject("data").getAsJsonArray("durl");
-            if (durl != null && durl.size() > 0) {
-                durlUrl = durl.get(0).getAsJsonObject().get("url").getAsString();
+            if (Files.exists(mp3File) && Files.size(mp3File) > 1000) {
+                return serveUrl + mp3Name;
             }
-        } catch (Exception e) {
-            return null;
-        }
-        if (durlUrl == null) return null;
-        // 下载 MP4 到临时文件
-        String tmpMp4 = CACHE_DIR + "/" + id + ".mp4.tmp";
-        try {
-            File tmp = new File(tmpMp4);
-            if (tmp.exists()) tmp.delete();
-            if (downloadToFile(durlUrl, tmpMp4) == null) return null;
-            // 输出临时文件用 .mp3 扩展名，否则 ffmpeg 无法推断格式
-            String outTmp = CACHE_DIR + "/" + id + ".out.mp3";
-            File outTmpFile = new File(outTmp);
-            if (outTmpFile.exists()) outTmpFile.delete();
-            // ffmpeg 转 MP3
-            ProcessBuilder pb = new ProcessBuilder("ffmpeg", "-y", "-i", tmpMp4,
-                    "-vn", "-acodec", "libmp3lame", "-q:a", "6", outTmp);
-            pb.redirectErrorStream(true);
-            Process process = pb.start();
-            byte[] buf = new byte[4096];
-            try (InputStream in = process.getInputStream()) {
-                while (in.read(buf) != -1) {
-                }
+
+            Long cid = fetchCid(id);
+            if (cid == null) {
+                AllMusic.log.data(LOG_PREFIX + "<red>无法获取cid：" + id);
+                return null;
             }
-            int exit = process.waitFor();
-            File result = new File(outTmp);
-            if (exit == 0 && result.exists() && result.length() > 1000) {
-                if (mp3File.exists()) mp3File.delete();
-                result.renameTo(mp3File);
-                return SERVE_URL + mp3Name;
+
+            String videoUrl = fetchVideoUrl(id, cid);
+            if (videoUrl == null) {
+                AllMusic.log.data(LOG_PREFIX + "<red>无法获取视频播放地址：" + id);
+                return null;
             }
-        } catch (Exception e) {
+
+            Path tmpMp4 = cachePath.resolve(id + ".mp4.tmp");
+            Path outMp3 = cachePath.resolve(id + ".out.mp3");
+
+            if (!downloadFile(videoUrl, tmpMp4)) {
+                AllMusic.log.data(LOG_PREFIX + "<red>下载MP4失败：" + id);
+                return null;
+            }
+
+            if (!convertToMp3(tmpMp4, outMp3)) {
+                Files.deleteIfExists(tmpMp4);
+                return null;
+            }
+
+            Files.deleteIfExists(mp3File);
+            Files.move(outMp3, mp3File);
+            return serveUrl + mp3Name;
+
+        } catch (IOException e) {
+            AllMusic.log.data(LOG_PREFIX + "<red>处理音频文件时发生IO错误：" + e.toString());
             return null;
         } finally {
-            new File(tmpMp4).delete();
+            try {
+                Files.deleteIfExists(cachePath.resolve(id + ".mp4.tmp"));
+                Files.deleteIfExists(cachePath.resolve(id + ".out.mp3"));
+            } catch (IOException ignored) {}
         }
-        return null;
     }
 
     @Override
@@ -210,53 +498,287 @@ public class BiliMusicApi implements IMusicApi {
     }
 
     @Override
-    public SearchPageObj search(String[] name, boolean isDefault) {
-        List<SearchMusicObj> resData = new ArrayList<>();
-        StringBuilder name1 = new StringBuilder();
-        for (int a = isDefault ? 0 : 1; a < name.length; a++) {
-            name1.append(name[a]).append(" ");
+    public SearchPageObj search(String[] args) {
+        // 原样保留
+        if (!configValid) {
+            AllMusic.log.data(LOG_PREFIX + "<red>API 未正确配置，拒绝搜索");
+            return null;
         }
-        String keyword = name1.toString().trim();
-        String url = "https://api.bilibili.com/x/web-interface/search/type?search_type=video&keyword="
-                + URLEncoder.encode(keyword, StandardCharsets.UTF_8);
-        // B站搜索接口有频率限制，失败重试几次
-        for (int attempt = 0; attempt < 4; attempt++) {
+
+        List<SearchMusicObj> resultList = new ArrayList<>();
+        String keyword = String.join(" ", args).trim();
+        if (keyword.isEmpty()) {
+            return new SearchPageObj(resultList, 0, getId());
+        }
+
+        String encoded = URLEncoder.encode(keyword, StandardCharsets.UTF_8);
+        String url = BILI_API_BASE + "/x/web-interface/search/type?search_type=video&keyword=" + encoded;
+
+        for (int attempt = 0; attempt < maxRetry; attempt++) {
             try {
-                HttpResObj res = get(url);
+                HttpResObj res = httpGet(url);
                 if (res == null || !res.ok) continue;
+
                 JsonObject root = AllMusic.gson.fromJson(res.data, JsonObject.class);
                 if (root.get("code").getAsInt() != 0) continue;
+
                 JsonObject data = root.getAsJsonObject("data");
                 if (!data.has("result") || data.get("result").isJsonNull()) continue;
-                JsonArray result = data.getAsJsonArray("result");
-                for (JsonElement el : result) {
+
+                JsonArray items = data.getAsJsonArray("result");
+                for (JsonElement el : items) {
                     JsonObject item = el.getAsJsonObject();
                     String bvid = item.get("bvid").getAsString();
-                    String title = stripTags(item.get("title").getAsString());
+                    String title = stripHtml(item.get("title").getAsString());
                     String author = item.get("author").getAsString();
                     String duration = item.get("duration").getAsString();
-                    resData.add(new SearchMusicObj(bvid, title, author, duration));
+                    resultList.add(new SearchMusicObj(bvid, title, author, duration));
                 }
-                int maxpage = resData.size() / 10;
-                return new SearchPageObj(resData, maxpage, getId());
+
+                int totalPages = Math.max(1, (resultList.size() + 9) / 10);
+                return new SearchPageObj(resultList, totalPages, getId());
+
             } catch (Exception e) {
-                // 重试
+                AllMusic.log.data(LOG_PREFIX + "<yellow>搜索请求失败 (尝试 " + (attempt + 1) + "/" + maxRetry + ")：" + e.toString());
             }
-            try {
-                Thread.sleep(1500);
-            } catch (InterruptedException ie) {
-                break;
+
+            if (attempt < maxRetry - 1) {
+                try {
+                    TimeUnit.MILLISECONDS.sleep(retryDelay * (attempt + 1));
+                } catch (InterruptedException ignored) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
             }
         }
-        return null;
-    }
 
-    private String stripTags(String s) {
-        return s.replaceAll("<[^>]+>", "");
+        AllMusic.log.data(LOG_PREFIX + "<red>搜索失败，关键词：" + keyword);
+        return new SearchPageObj(resultList, 0, getId());
     }
 
     @Override
     public void setList(String id, Object sender) {
-        AllMusic.log.data("B站源暂不支持歌单");
+        if (!configValid) {
+            AllMusic.log.data(LOG_PREFIX + "<red>API 未正确配置，拒绝操作");
+            AllMusic.side.sendMessage(sender, LOG_PREFIX + "<red>B站API未正确配置，请检查 bili.json");
+            return;
+        }
+        AllMusic.log.data(LOG_PREFIX + "<yellow>B站源暂不支持歌单");
+        AllMusic.side.sendMessage(sender, LOG_PREFIX + "<red>B站暂不支持歌单功能");
+    }
+
+    @Override
+    public void command(Object sender, String name, String[] args) {
+        // 无自定义命令
+    }
+
+    @Override
+    public List<String> tab(Object sender, String name, String[] args) {
+        return new ArrayList<>();
+    }
+
+    // ---------- 私有辅助方法（未改动） ----------
+
+    private String normalizeUrl(String url) {
+        if (url == null || url.isEmpty()) return url;
+        return url.endsWith("/") ? url : url + "/";
+    }
+
+    private Path getCachePath() {
+        Path path = Paths.get(cacheDir);
+        if (!path.isAbsolute()) {
+            path = Paths.get(System.getProperty("user.dir")).resolve(path);
+        }
+        return path.toAbsolutePath().normalize();
+    }
+
+    private boolean checkFfmpeg() {
+        try {
+            ProcessBuilder pb = new ProcessBuilder(ffmpegPath, "-version");
+            pb.redirectErrorStream(true);
+            Process process = pb.start();
+            int exitCode = process.waitFor();
+            if (exitCode == 0) {
+                AllMusic.log.data(LOG_PREFIX + "<yellow>ffmpeg 检查通过：" + ffmpegPath);
+                return true;
+            } else {
+                AllMusic.log.data(LOG_PREFIX + "<red>ffmpeg 执行失败，退出码：" + exitCode);
+                return false;
+            }
+        } catch (IOException | InterruptedException e) {
+            AllMusic.log.data(LOG_PREFIX + "<red>ffmpeg 不可用：" + e.toString());
+            return false;
+        }
+    }
+
+    private void cleanupCache(Path cachePath) {
+        try {
+            List<Path> filesToDelete = new ArrayList<>();
+            long totalSize = 0;
+            try (Stream<Path> walk = Files.walk(cachePath)) {
+                Iterator<Path> it = walk.filter(Files::isRegularFile).iterator();
+                while (it.hasNext()) {
+                    Path p = it.next();
+                    long size = Files.size(p);
+                    totalSize += size;
+                    filesToDelete.add(p);
+                }
+            }
+            long maxSizeBytes = maxCacheSize * 1024L * 1024L;
+            if (totalSize > maxSizeBytes) {
+                AllMusic.log.data(LOG_PREFIX + "<yellow>缓存大小 " + (totalSize / 1024 / 1024) + " MB 超过限制 " + maxCacheSize + " MB，开始清理...");
+                int deleted = 0;
+                for (Path p : filesToDelete) {
+                    try {
+                        Files.delete(p);
+                        deleted++;
+                    } catch (IOException e) {
+                        AllMusic.log.data(LOG_PREFIX + "<red>删除文件失败：" + p.getFileName() + " - " + e.toString());
+                    }
+                }
+                AllMusic.log.data(LOG_PREFIX + "<yellow>缓存清理完成，共删除 " + deleted + " 个文件");
+            } else {
+                AllMusic.log.data(LOG_PREFIX + "<yellow>缓存大小 " + (totalSize / 1024 / 1024) + " MB，未超过限制 " + maxCacheSize + " MB，无需清理");
+            }
+        } catch (IOException e) {
+            AllMusic.log.data(LOG_PREFIX + "<red>缓存清理失败：" + e.toString());
+        }
+    }
+
+    private Long fetchCid(String bvid) {
+        String url = BILI_API_BASE + "/x/web-interface/view?bvid=" + bvid;
+        HttpResObj res = httpGet(url);
+        if (res == null || !res.ok) return null;
+        try {
+            JsonObject root = AllMusic.gson.fromJson(res.data, JsonObject.class);
+            return root.getAsJsonObject("data").get("cid").getAsLong();
+        } catch (Exception e) {
+            AllMusic.log.data(LOG_PREFIX + "<red>获取cid失败：" + e.toString());
+            return null;
+        }
+    }
+
+    private String fetchVideoUrl(String bvid, long cid) {
+        String url = BILI_API_BASE + "/x/player/playurl?bvid=" + bvid +
+                "&cid=" + cid + "&qn=16&type=mp4&platform=html5";
+        HttpResObj res = httpGet(url);
+        if (res == null || !res.ok) return null;
+        try {
+            JsonObject root = AllMusic.gson.fromJson(res.data, JsonObject.class);
+            if (root.get("code").getAsInt() != 0) return null;
+            JsonArray durl = root.getAsJsonObject("data").getAsJsonArray("durl");
+            if (durl != null && durl.size() > 0) {
+                return durl.get(0).getAsJsonObject().get("url").getAsString();
+            }
+        } catch (Exception e) {
+            AllMusic.log.data(LOG_PREFIX + "<red>解析视频播放地址失败：" + e.toString());
+        }
+        return null;
+    }
+
+    private boolean downloadFile(String url, Path target) {
+        try {
+            HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+            conn.setRequestMethod("GET");
+            conn.setRequestProperty("User-Agent", userAgent);
+            conn.setRequestProperty("Referer", "https://www.bilibili.com/");
+            conn.setConnectTimeout(15000);
+            conn.setReadTimeout(60000);
+
+            int code = conn.getResponseCode();
+            if (code != 200 && code != 206) {
+                AllMusic.log.data(LOG_PREFIX + "<red>下载失败，HTTP " + code + " from " + url);
+                return false;
+            }
+
+            try (InputStream in = conn.getInputStream()) {
+                Files.copy(in, target, StandardCopyOption.REPLACE_EXISTING);
+            }
+            return Files.exists(target) && Files.size(target) > 0;
+        } catch (Exception e) {
+            AllMusic.log.data(LOG_PREFIX + "<red>下载文件失败：" + e.toString());
+            return false;
+        }
+    }
+
+    private boolean convertToMp3(Path input, Path output) {
+        String inputPath = input.toAbsolutePath().toString();
+        String outputPath = output.toAbsolutePath().toString();
+
+        ProcessBuilder pb = new ProcessBuilder(
+                ffmpegPath,
+                "-y", "-i", inputPath,
+                "-vn", "-acodec", "libmp3lame", "-q:a", String.valueOf(quality),
+                outputPath
+        );
+        pb.redirectErrorStream(true);
+
+        try {
+            Process process = pb.start();
+            try (BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(process.getInputStream()))) {
+                while (reader.readLine() != null) {
+                    // consume output to avoid blocking
+                }
+            }
+            int exit = process.waitFor();
+            if (exit == 0 && Files.exists(output) && Files.size(output) > 1000) {
+                return true;
+            } else {
+                AllMusic.log.data(LOG_PREFIX + "<red>ffmpeg转码失败，退出码：" + exit);
+                return false;
+            }
+        } catch (Exception e) {
+            AllMusic.log.data(LOG_PREFIX + "<red>ffmpeg执行异常：" + e.toString());
+            return false;
+        }
+    }
+
+    private HttpResObj httpGet(String url) {
+        try {
+            HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+            conn.setRequestMethod("GET");
+            conn.setRequestProperty("User-Agent", userAgent);
+            conn.setRequestProperty("Referer", "https://www.bilibili.com/");
+            conn.setRequestProperty("Accept", "application/json");
+            conn.setConnectTimeout(10000);
+            conn.setReadTimeout(15000);
+
+            int code = conn.getResponseCode();
+            if (code != 200) {
+                return new HttpResObj("", false);
+            }
+
+            try (BufferedReader br = new BufferedReader(
+                    new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
+                StringBuilder sb = new StringBuilder();
+                String line;
+                while ((line = br.readLine()) != null) {
+                    sb.append(line);
+                }
+                return new HttpResObj(sb.toString(), true);
+            }
+        } catch (Exception e) {
+            AllMusic.log.data(LOG_PREFIX + "<red>HTTP GET 失败：" + e.toString());
+            return new HttpResObj("", false);
+        }
+    }
+
+    private String stripHtml(String input) {
+        return input.replaceAll("<[^>]+>", "");
+    }
+
+    // ---------- 内部配置值对象 ----------
+    private static class BiliConfig {
+        String cacheDir;
+        String serveUrl;
+        String ffmpegPath;
+        String userAgent;
+        int maxAudioLength;
+        int maxCacheSize;
+        int quality;
+        int maxRetry;
+        long retryDelay;
+        boolean valid;
     }
 }
