@@ -129,7 +129,7 @@ allmusic-bilibili/
 ### 前置要求
 
 - Paper 26.1.2（AllMusic 4.x）服务器
-- Java 17+ 和 Python 3
+- Java 17+ 和 Python
 - **ffmpeg**（服务端转码用）：`sudo apt install ffmpeg`
 - （可选）Caddy（或任意反代）：`sudo apt install caddy`
 
