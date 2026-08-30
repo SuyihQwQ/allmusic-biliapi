@@ -35,7 +35,7 @@ public class BiliMusicApi implements IMusicApi {
     // 必填项
     private String cacheDir = null;
     private String serveUrl = null;
-    private int quality = 6;               // 必填，0-9
+    private int quality = 6;               // 默认 6，非必填
 
     // 可选顶层
     private String ffmpegPath = "ffmpeg";
@@ -68,7 +68,6 @@ public class BiliMusicApi implements IMusicApi {
                 // ---- 读取必填项 ----
                 String tmpCacheDir = null;
                 String tmpServeUrl = null;
-                int tmpQuality = -1;
                 if (config.has("cacheDir")) {
                     String dir = config.get("cacheDir").getAsString();
                     if (dir != null && !dir.trim().isEmpty()) tmpCacheDir = dir.trim();
@@ -77,20 +76,26 @@ public class BiliMusicApi implements IMusicApi {
                     String url = config.get("serveUrl").getAsString();
                     if (url != null && !url.trim().isEmpty()) tmpServeUrl = normalizeUrl(url.trim());
                 }
+
+                // ---- 读取 quality（非必填，缺失或无效则使用默认 6） ----
+                int tmpQuality = 6;
                 if (config.has("quality")) {
                     try {
                         int q = config.get("quality").getAsInt();
                         if (q >= 0 && q <= 9) {
                             tmpQuality = q;
                         } else {
-                            AllMusic.log.data("<light_purple>[BiliAPI]<red>quality 值超出 0-9 范围：" + q);
+                            AllMusic.log.data("<light_purple>[BiliAPI]<yellow>quality 值超出 0-9 范围（" + q + "），将使用默认值 6");
+                            tmpQuality = 6;
                         }
                     } catch (NumberFormatException e) {
-                        AllMusic.log.data("<light_purple>[BiliAPI]<red>quality 不是有效整数");
+                        AllMusic.log.data("<light_purple>[BiliAPI]<yellow>quality 不是有效整数，将使用默认值 6");
+                        tmpQuality = 6;
                     }
                 } else {
-                    AllMusic.log.data("<light_purple>[BiliAPI]<red>配置缺少 quality 字段");
+                    AllMusic.log.data("<light_purple>[BiliAPI]<yellow>未配置 quality，将使用默认值 6");
                 }
+                quality = tmpQuality;
 
                 // ---- 读取可选顶层 ----
                 if (config.has("ffmpegPath")) {
@@ -168,11 +173,10 @@ public class BiliMusicApi implements IMusicApi {
                     AllMusic.log.data("<light_purple>[BiliAPI]<yellow>配置中无 advanced 对象，使用默认 advanced 参数");
                 }
 
-                // ---- 综合检查 ----
-                if (tmpCacheDir != null && tmpServeUrl != null && tmpQuality >= 0) {
+                // ---- 综合检查（仅依赖 cacheDir 和 serveUrl） ----
+                if (tmpCacheDir != null && tmpServeUrl != null) {
                     cacheDir = tmpCacheDir;
                     serveUrl = tmpServeUrl;
-                    quality = tmpQuality;
                     maxRetry = tmpMaxRetry;
                     retryDelay = tmpRetryDelay;
                     userAgent = tmpUserAgent;
@@ -210,7 +214,7 @@ public class BiliMusicApi implements IMusicApi {
                         configValid = false;
                     }
                 } else {
-                    AllMusic.log.data("<light_purple>[BiliAPI]<red>配置缺少必要项（cacheDir、serveUrl 或 quality）");
+                    AllMusic.log.data("<light_purple>[BiliAPI]<red>配置缺少必要项（cacheDir 或 serveUrl）");
                     configBroken = true;
                 }
 
@@ -262,7 +266,7 @@ public class BiliMusicApi implements IMusicApi {
                 try (FileWriter writer = new FileWriter(configFile)) {
                     writer.write(AllMusic.gson.toJson(defaultConfig));
                 }
-                AllMusic.log.data("<light_purple>[BiliAPI]<yellow>已重新生成 bili.json，请填写 cacheDir、serveUrl 和 quality 后重载");
+                AllMusic.log.data("<light_purple>[BiliAPI]<yellow>已重新生成 bili.json，请填写 cacheDir 和 serveUrl 后重载");
             } catch (Exception e) {
                 AllMusic.log.data("<light_purple>[BiliAPI]<red>重新生成 bili.json 失败：" + e.toString());
             }
@@ -285,7 +289,7 @@ public class BiliMusicApi implements IMusicApi {
                 AllMusic.log.data("<light_purple>[BiliAPI]<yellow>最大缓存大小：无限制");
             }
         } else {
-            AllMusic.log.data("<light_purple>[BiliAPI]<red>B站API加载失败：请确保 cacheDir、serveUrl 和 quality (0-9) 已正确配置，且 ffmpeg 可执行");
+            AllMusic.log.data("<light_purple>[BiliAPI]<red>B站API加载失败：请确保 cacheDir 和 serveUrl 已正确配置，且 ffmpeg 可执行");
         }
     }
 
@@ -541,6 +545,16 @@ public class BiliMusicApi implements IMusicApi {
 
     @Override
     public SearchPageObj search(String[] args) {
+        return search(args, false);
+    }
+
+    /**
+     * 新增的 search 方法（支持 isList 参数），直接调用原有逻辑。
+     * @param args 搜索关键词
+     * @param isList 是否用于列表（未使用）
+     * @return 搜索结果
+     */
+    public SearchPageObj search(String[] args, boolean isList) {
         if (!configValid) {
             AllMusic.log.data("<light_purple>[BiliAPI]<red>API 未正确配置，拒绝搜索");
             return null;
