@@ -29,23 +29,23 @@ import java.util.stream.Stream;
 
 public class BiliMusicApi implements IMusicApi {
 
-    private static final String LOG_PREFIX = "<light_purple>[BiliAPI]";
     private static final String BILI_API_BASE = "https://api.bilibili.com";
+    private static final String DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
     // 必填项
     private String cacheDir = null;
     private String serveUrl = null;
+    private int quality = 6;               // 必填，0-9
 
     // 可选顶层
     private String ffmpegPath = "ffmpeg";
-    private String userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-    private int maxAudioLength = 45;          // 单位：分钟，0 表示不限制
-    private int maxCacheSize = 100;           // 单位：MB，0 表示不限制
+    private int maxAudioLength = 45;       // 单位：分钟，0 表示不限制
+    private int maxCacheSize = 100;        // 单位：MB，0 表示不限制
 
     // advanced 选项
     private int maxRetry = 3;
     private long retryDelay = 1500L;
-    private int quality = 6;
+    private String userAgent = DEFAULT_USER_AGENT;
 
     private volatile boolean isUpdate;
     private boolean configValid = false;
@@ -58,266 +58,309 @@ public class BiliMusicApi implements IMusicApi {
         configFile = new File(path, "bili.json");
         configValid = false;
 
-        // 尝试加载并验证配置
-        BiliConfig cfg = loadAndValidateConfig();
-        if (cfg != null && cfg.valid) {
-            // 应用配置值
-            applyConfig(cfg);
-            // 验证 ffmpeg 和缓存目录
-            if (validateEnvironment()) {
-                configValid = true;
-                logConfigStatus();
-            } else {
-                configValid = false;
-                AllMusic.log.data(LOG_PREFIX + "<red>B站API加载失败：ffmpeg 或缓存目录不可用");
+        boolean configBroken = false;
+        if (configFile.exists()) {
+            try (InputStreamReader reader = new InputStreamReader(
+                    Files.newInputStream(configFile.toPath()), StandardCharsets.UTF_8);
+                 BufferedReader bf = new BufferedReader(reader)) {
+                JsonObject config = AllMusic.gson.fromJson(bf, JsonObject.class);
+
+                // ---- 读取必填项 ----
+                String tmpCacheDir = null;
+                String tmpServeUrl = null;
+                int tmpQuality = -1;
+                if (config.has("cacheDir")) {
+                    String dir = config.get("cacheDir").getAsString();
+                    if (dir != null && !dir.trim().isEmpty()) tmpCacheDir = dir.trim();
+                }
+                if (config.has("serveUrl")) {
+                    String url = config.get("serveUrl").getAsString();
+                    if (url != null && !url.trim().isEmpty()) tmpServeUrl = normalizeUrl(url.trim());
+                }
+                if (config.has("quality")) {
+                    try {
+                        int q = config.get("quality").getAsInt();
+                        if (q >= 0 && q <= 9) {
+                            tmpQuality = q;
+                        } else {
+                            AllMusic.log.data("<light_purple>[BiliAPI]<red>quality 值超出 0-9 范围：" + q);
+                        }
+                    } catch (NumberFormatException e) {
+                        AllMusic.log.data("<light_purple>[BiliAPI]<red>quality 不是有效整数");
+                    }
+                } else {
+                    AllMusic.log.data("<light_purple>[BiliAPI]<red>配置缺少 quality 字段");
+                }
+
+                // ---- 读取可选顶层 ----
+                if (config.has("ffmpegPath")) {
+                    String f = config.get("ffmpegPath").getAsString();
+                    if (f != null && !f.trim().isEmpty()) ffmpegPath = f.trim();
+                }
+
+                // ---- 读取 maxAudioLength ----
+                int tmpMaxLen = 45;
+                if (config.has("maxAudioLength")) {
+                    try {
+                        int val = config.get("maxAudioLength").getAsInt();
+                        if (val >= 0) {
+                            tmpMaxLen = val;
+                        } else {
+                            tmpMaxLen = 45;
+                            AllMusic.log.data("<light_purple>[BiliAPI]<yellow>maxAudioLength 为负数，已回退到 45 分钟");
+                        }
+                    } catch (NumberFormatException e) {
+                        AllMusic.log.data("<light_purple>[BiliAPI]<red>maxAudioLength 不是有效整数，将使用默认 45");
+                        tmpMaxLen = 45;
+                    }
+                } else {
+                    tmpMaxLen = 45;
+                }
+                maxAudioLength = tmpMaxLen;
+
+                // ---- 读取 maxCacheSize ----
+                int tmpMaxCache = 100;
+                if (config.has("maxCacheSize")) {
+                    try {
+                        int val = config.get("maxCacheSize").getAsInt();
+                        if (val >= 0) {
+                            tmpMaxCache = val;
+                        } else {
+                            tmpMaxCache = 100;
+                            AllMusic.log.data("<light_purple>[BiliAPI]<yellow>maxCacheSize 为负数，已回退到 100 MB");
+                        }
+                    } catch (NumberFormatException e) {
+                        AllMusic.log.data("<light_purple>[BiliAPI]<red>maxCacheSize 不是有效整数，将使用默认 100 MB");
+                        tmpMaxCache = 100;
+                    }
+                } else {
+                    tmpMaxCache = 100;
+                }
+                maxCacheSize = tmpMaxCache;
+
+                // ---- 读取 advanced 对象 ----
+                int tmpMaxRetry = 3;
+                long tmpRetryDelay = 1500L;
+                String tmpUserAgent = DEFAULT_USER_AGENT;
+
+                if (config.has("advanced") && config.get("advanced").isJsonObject()) {
+                    JsonObject adv = config.getAsJsonObject("advanced");
+
+                    if (adv.has("maxRetry")) {
+                        try {
+                            int mr = adv.get("maxRetry").getAsInt();
+                            if (mr > 0) tmpMaxRetry = mr;
+                        } catch (NumberFormatException ignored) {}
+                    }
+                    if (adv.has("retryDelay")) {
+                        try {
+                            long rd = adv.get("retryDelay").getAsLong();
+                            if (rd > 0) tmpRetryDelay = rd;
+                        } catch (NumberFormatException ignored) {}
+                    }
+                    if (adv.has("userAgent")) {
+                        String ua = adv.get("userAgent").getAsString();
+                        if (ua != null && !ua.trim().isEmpty()) {
+                            tmpUserAgent = ua.trim();
+                        }
+                    }
+                } else {
+                    AllMusic.log.data("<light_purple>[BiliAPI]<yellow>配置中无 advanced 对象，使用默认 advanced 参数");
+                }
+
+                // ---- 综合检查 ----
+                if (tmpCacheDir != null && tmpServeUrl != null && tmpQuality >= 0) {
+                    cacheDir = tmpCacheDir;
+                    serveUrl = tmpServeUrl;
+                    quality = tmpQuality;
+                    maxRetry = tmpMaxRetry;
+                    retryDelay = tmpRetryDelay;
+                    userAgent = tmpUserAgent;
+
+                    // 验证缓存目录是否存在
+                    Path cachePath = getCachePath();
+                    if (Files.exists(cachePath) && Files.isDirectory(cachePath)) {
+                        // 检查 ffmpeg 可用性
+                        if (checkFfmpeg()) {
+                            // 缓存清理（如果启用）
+                            if (maxCacheSize > 0) {
+                                cleanupCache(cachePath);
+                            } else {
+                                AllMusic.log.data("<light_purple>[BiliAPI]<yellow>缓存清理已禁用（maxCacheSize=0）");
+                            }
+                            configValid = true;
+                            AllMusic.log.data("<light_purple>[BiliAPI]<yellow>缓存目录存在：" + cachePath.toAbsolutePath());
+                            if (maxAudioLength > 0) {
+                                AllMusic.log.data("<light_purple>[BiliAPI]<yellow>最大音频时长限制：" + maxAudioLength + " 分钟");
+                            } else {
+                                AllMusic.log.data("<light_purple>[BiliAPI]<yellow>最大音频时长限制：无限制");
+                            }
+                            if (maxCacheSize > 0) {
+                                AllMusic.log.data("<light_purple>[BiliAPI]<yellow>最大缓存大小：" + maxCacheSize + " MB");
+                            } else {
+                                AllMusic.log.data("<light_purple>[BiliAPI]<yellow>最大缓存大小：无限制");
+                            }
+                        } else {
+                            AllMusic.log.data("<light_purple>[BiliAPI]<red>ffmpeg 不可用，请检查 ffmpeg 路径是否正确");
+                            configValid = false;
+                        }
+                    } else {
+                        AllMusic.log.data("<light_purple>[BiliAPI]<red>缓存目录不存在或不是目录：" + cachePath.toAbsolutePath());
+                        AllMusic.log.data("<light_purple>[BiliAPI]<red>请创建该目录或修改 cacheDir 配置");
+                        configValid = false;
+                    }
+                } else {
+                    AllMusic.log.data("<light_purple>[BiliAPI]<red>配置缺少必要项（cacheDir、serveUrl 或 quality）");
+                    configBroken = true;
+                }
+
+            } catch (JsonParseException e) {
+                AllMusic.log.data("<light_purple>[BiliAPI]<red>配置文件 JSON 格式错误：" + e.toString());
+                configBroken = true;
+            } catch (Exception e) {
+                AllMusic.log.data("<light_purple>[BiliAPI]<red>读取配置文件异常：" + e.toString());
+                configBroken = true;
             }
         } else {
-            // 配置缺失或无效，生成默认配置
-            createDefaultConfigFile();
-            AllMusic.log.data(LOG_PREFIX + "<yellow>已生成默认 bili.json，请填写 cacheDir、serveUrl 后重载");
+            configBroken = true;
+        }
+
+        // 如果配置文件损坏或不存在，重新生成默认配置
+        if (configBroken || !configFile.exists()) {
+            if (configFile.exists()) {
+                try {
+                    File backup = new File(configFile.getParent(), "bili.json.bak");
+                    if (backup.exists()) backup.delete();
+                    Files.move(configFile.toPath(), backup.toPath());
+                    AllMusic.log.data("<light_purple>[BiliAPI]<yellow>已备份损坏的配置文件到：" + backup.getName());
+                } catch (IOException e) {
+                    AllMusic.log.data("<light_purple>[BiliAPI]<red>备份损坏配置文件失败，将直接覆盖：" + e.toString());
+                }
+            }
+
+            try {
+                File parent = configFile.getParentFile();
+                if (parent != null && !parent.exists()) {
+                    if (!parent.mkdirs()) {
+                        AllMusic.log.data("<light_purple>[BiliAPI]<red>无法创建配置目录：" + parent.getAbsolutePath());
+                    }
+                }
+                JsonObject defaultConfig = new JsonObject();
+                defaultConfig.addProperty("cacheDir", "");
+                defaultConfig.addProperty("serveUrl", "");
+                defaultConfig.addProperty("ffmpegPath", "ffmpeg");
+                defaultConfig.addProperty("maxAudioLength", 45);
+                defaultConfig.addProperty("maxCacheSize", 100);
+                defaultConfig.addProperty("quality", 6);
+
+                JsonObject adv = new JsonObject();
+                adv.addProperty("maxRetry", 3);
+                adv.addProperty("retryDelay", 1500);
+                adv.addProperty("userAgent", DEFAULT_USER_AGENT);
+                defaultConfig.add("advanced", adv);
+
+                try (FileWriter writer = new FileWriter(configFile)) {
+                    writer.write(AllMusic.gson.toJson(defaultConfig));
+                }
+                AllMusic.log.data("<light_purple>[BiliAPI]<yellow>已重新生成 bili.json，请填写 cacheDir、serveUrl 和 quality 后重载");
+            } catch (Exception e) {
+                AllMusic.log.data("<light_purple>[BiliAPI]<red>重新生成 bili.json 失败：" + e.toString());
+            }
             configValid = false;
         }
-    }
 
-    /**
-     * 加载并验证配置文件，返回配置值对象；若文件损坏或缺失则返回 null。
-     */
-    private BiliConfig loadAndValidateConfig() {
-        if (!configFile.exists()) {
-            return null;
-        }
-
-        JsonObject root;
-        try (InputStreamReader reader = new InputStreamReader(
-                Files.newInputStream(configFile.toPath()), StandardCharsets.UTF_8);
-             BufferedReader bf = new BufferedReader(reader)) {
-            root = AllMusic.gson.fromJson(bf, JsonObject.class);
-        } catch (JsonParseException e) {
-            AllMusic.log.data(LOG_PREFIX + "<red>配置文件 JSON 格式错误：" + e.toString());
-            backupBrokenConfig();
-            return null;
-        } catch (Exception e) {
-            AllMusic.log.data(LOG_PREFIX + "<red>读取配置文件异常：" + e.toString());
-            backupBrokenConfig();
-            return null;
-        }
-
-        // 提取必填项
-        String tmpCacheDir = null;
-        String tmpServeUrl = null;
-        if (root.has("cacheDir")) {
-            String dir = root.get("cacheDir").getAsString();
-            if (dir != null && !dir.trim().isEmpty()) tmpCacheDir = dir.trim();
-        }
-        if (root.has("serveUrl")) {
-            String url = root.get("serveUrl").getAsString();
-            if (url != null && !url.trim().isEmpty()) tmpServeUrl = normalizeUrl(url.trim());
-        }
-
-        // 如果必填项缺失，直接返回 null（后续会生成默认配置）
-        if (tmpCacheDir == null || tmpServeUrl == null) {
-            AllMusic.log.data(LOG_PREFIX + "<red>配置缺少 cacheDir 或 serveUrl");
-            return null;
-        }
-
-        // 解析可选配置
-        BiliConfig cfg = new BiliConfig();
-        cfg.cacheDir = tmpCacheDir;
-        cfg.serveUrl = tmpServeUrl;
-        cfg.ffmpegPath = root.has("ffmpegPath") ? root.get("ffmpegPath").getAsString() : "ffmpeg";
-        cfg.userAgent = root.has("userAgent") ? root.get("userAgent").getAsString() :
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-
-        // maxAudioLength
-        cfg.maxAudioLength = 45;
-        if (root.has("maxAudioLength")) {
-            try {
-                int val = root.get("maxAudioLength").getAsInt();
-                if (val >= 0) cfg.maxAudioLength = val;
-                else AllMusic.log.data(LOG_PREFIX + "<yellow>maxAudioLength 为负数，使用默认 45");
-            } catch (NumberFormatException e) {
-                AllMusic.log.data(LOG_PREFIX + "<red>maxAudioLength 不是有效整数，使用默认 45");
-            }
-        }
-
-        // maxCacheSize
-        cfg.maxCacheSize = 100;
-        if (root.has("maxCacheSize")) {
-            try {
-                int val = root.get("maxCacheSize").getAsInt();
-                if (val >= 0) cfg.maxCacheSize = val;
-                else AllMusic.log.data(LOG_PREFIX + "<yellow>maxCacheSize 为负数，使用默认 100");
-            } catch (NumberFormatException e) {
-                AllMusic.log.data(LOG_PREFIX + "<red>maxCacheSize 不是有效整数，使用默认 100");
-            }
-        }
-
-        // 解析 advanced 对象
-        parseAdvanced(root, cfg);
-
-        // 标记有效（只要 cacheDir 和 serveUrl 存在即可）
-        cfg.valid = true;
-        return cfg;
-    }
-
-    /**
-     * 解析 advanced 子对象，缺失字段使用默认值并记录警告。
-     */
-    private void parseAdvanced(JsonObject root, BiliConfig cfg) {
-        // 默认值
-        cfg.quality = 6;
-        cfg.maxRetry = 3;
-        cfg.retryDelay = 1500L;
-
-        if (root.has("advanced") && root.get("advanced").isJsonObject()) {
-            JsonObject adv = root.getAsJsonObject("advanced");
-            // quality
-            if (adv.has("quality")) {
-                try {
-                    int q = adv.get("quality").getAsInt();
-                    if (q >= 0 && q <= 9) {
-                        cfg.quality = q;
-                    } else {
-                        AllMusic.log.data(LOG_PREFIX + "<red>quality 值超出 0-9 范围：" + q + "，使用默认 6");
-                    }
-                } catch (NumberFormatException e) {
-                    AllMusic.log.data(LOG_PREFIX + "<red>quality 不是有效整数，使用默认 6");
-                }
+        if (configValid) {
+            AllMusic.log.data("<light_purple>[BiliAPI]<yellow>B站API已加载");
+            AllMusic.log.data("<light_purple>[BiliAPI]<yellow>缓存目录：" + getCachePath().toAbsolutePath());
+            AllMusic.log.data("<light_purple>[BiliAPI]<yellow>serveUrl：" + serveUrl);
+            AllMusic.log.data("<light_purple>[BiliAPI]<yellow>音质参数 (quality)：" + quality);
+            if (maxAudioLength > 0) {
+                AllMusic.log.data("<light_purple>[BiliAPI]<yellow>最大音频时长限制：" + maxAudioLength + " 分钟");
             } else {
-                AllMusic.log.data(LOG_PREFIX + "<yellow>advanced.quality 缺失，使用默认值 6");
+                AllMusic.log.data("<light_purple>[BiliAPI]<yellow>最大音频时长限制：无限制");
             }
-
-            // maxRetry
-            if (adv.has("maxRetry")) {
-                try {
-                    int mr = adv.get("maxRetry").getAsInt();
-                    if (mr > 0) cfg.maxRetry = mr;
-                } catch (NumberFormatException ignored) {}
-            }
-
-            // retryDelay
-            if (adv.has("retryDelay")) {
-                try {
-                    long rd = adv.get("retryDelay").getAsLong();
-                    if (rd > 0) cfg.retryDelay = rd;
-                } catch (NumberFormatException ignored) {}
+            if (maxCacheSize > 0) {
+                AllMusic.log.data("<light_purple>[BiliAPI]<yellow>最大缓存大小：" + maxCacheSize + " MB");
+            } else {
+                AllMusic.log.data("<light_purple>[BiliAPI]<yellow>最大缓存大小：无限制");
             }
         } else {
-            AllMusic.log.data(LOG_PREFIX + "<yellow>配置中缺少 advanced 对象，将使用默认值");
+            AllMusic.log.data("<light_purple>[BiliAPI]<red>B站API加载失败：请确保 cacheDir、serveUrl 和 quality (0-9) 已正确配置，且 ffmpeg 可执行");
         }
     }
 
     /**
-     * 将配置值应用到成员变量。
+     * 获取缓存目录的 Path 对象，自动处理相对/绝对路径。
+     * 前提：cacheDir 不为 null 且非空。
      */
-    private void applyConfig(BiliConfig cfg) {
-        this.cacheDir = cfg.cacheDir;
-        this.serveUrl = cfg.serveUrl;
-        this.ffmpegPath = cfg.ffmpegPath;
-        this.userAgent = cfg.userAgent;
-        this.maxAudioLength = cfg.maxAudioLength;
-        this.maxCacheSize = cfg.maxCacheSize;
-        this.quality = cfg.quality;
-        this.maxRetry = cfg.maxRetry;
-        this.retryDelay = cfg.retryDelay;
+    private Path getCachePath() {
+        Path path = Paths.get(cacheDir);
+        if (!path.isAbsolute()) {
+            path = Paths.get(System.getProperty("user.dir")).resolve(path);
+        }
+        return path.toAbsolutePath().normalize();
     }
 
     /**
-     * 验证 ffmpeg 和缓存目录，清理缓存（若启用）。
-     * @return true 如果环境准备就绪
+     * 检查 ffmpeg 是否可用
+     * @return true 如果 ffmpeg 可执行
      */
-    private boolean validateEnvironment() {
-        // 检查 ffmpeg
-        if (!checkFfmpeg()) {
-            AllMusic.log.data(LOG_PREFIX + "<red>ffmpeg 不可用，请检查 ffmpeg 路径是否正确");
+    private boolean checkFfmpeg() {
+        try {
+            ProcessBuilder pb = new ProcessBuilder(ffmpegPath, "-version");
+            pb.redirectErrorStream(true);
+            Process process = pb.start();
+            int exitCode = process.waitFor();
+            if (exitCode == 0) {
+                AllMusic.log.data("<light_purple>[BiliAPI]<yellow>ffmpeg 检查通过：" + ffmpegPath);
+                return true;
+            } else {
+                AllMusic.log.data("<light_purple>[BiliAPI]<red>ffmpeg 执行失败，退出码：" + exitCode);
+                return false;
+            }
+        } catch (IOException | InterruptedException e) {
+            AllMusic.log.data("<light_purple>[BiliAPI]<red>ffmpeg 不可用：" + e.toString());
             return false;
         }
-
-        // 检查缓存目录
-        Path cachePath = getCachePath();
-        if (!Files.exists(cachePath) || !Files.isDirectory(cachePath)) {
-            AllMusic.log.data(LOG_PREFIX + "<red>缓存目录不存在或不是目录：" + cachePath.toAbsolutePath());
-            AllMusic.log.data(LOG_PREFIX + "<red>请创建该目录或修改 cacheDir 配置");
-            return false;
-        }
-
-        // 如果启用缓存清理，执行清理
-        if (maxCacheSize > 0) {
-            cleanupCache(cachePath);
-        } else {
-            AllMusic.log.data(LOG_PREFIX + "<yellow>缓存清理已禁用（maxCacheSize=0）");
-        }
-        return true;
     }
 
     /**
-     * 打印当前配置状态日志。
+     * 清理缓存目录（合并统计和删除为一次遍历）
+     * @param cachePath 缓存目录路径
      */
-    private void logConfigStatus() {
-        AllMusic.log.data(LOG_PREFIX + "<yellow>B站API已加载");
-        AllMusic.log.data(LOG_PREFIX + "<yellow>缓存目录：" + getCachePath().toAbsolutePath());
-        AllMusic.log.data(LOG_PREFIX + "<yellow>serveUrl：" + serveUrl);
-        AllMusic.log.data(LOG_PREFIX + "<yellow>音质参数 (quality)：" + quality);
-        if (maxAudioLength > 0) {
-            AllMusic.log.data(LOG_PREFIX + "<yellow>最大音频时长限制：" + maxAudioLength + " 分钟");
-        } else {
-            AllMusic.log.data(LOG_PREFIX + "<yellow>最大音频时长限制：无限制");
-        }
-        if (maxCacheSize > 0) {
-            AllMusic.log.data(LOG_PREFIX + "<yellow>最大缓存大小：" + maxCacheSize + " MB");
-        } else {
-            AllMusic.log.data(LOG_PREFIX + "<yellow>最大缓存大小：无限制");
-        }
-    }
-
-    /**
-     * 备份损坏的配置文件（.bak）。
-     */
-    private void backupBrokenConfig() {
+    private void cleanupCache(Path cachePath) {
         try {
-            File backup = new File(configFile.getParent(), "bili.json.bak");
-            if (backup.exists()) backup.delete();
-            Files.move(configFile.toPath(), backup.toPath());
-            AllMusic.log.data(LOG_PREFIX + "<yellow>已备份损坏的配置文件到：" + backup.getName());
-        } catch (IOException e) {
-            AllMusic.log.data(LOG_PREFIX + "<red>备份损坏配置文件失败：" + e.toString());
-        }
-    }
-
-    /**
-     * 生成默认的配置文件（包含提示信息）。
-     */
-    private void createDefaultConfigFile() {
-        try {
-            File parent = configFile.getParentFile();
-            if (parent != null && !parent.exists()) {
-                if (!parent.mkdirs()) {
-                    AllMusic.log.data(LOG_PREFIX + "<red>无法创建配置目录：" + parent.getAbsolutePath());
+            List<Path> filesToDelete = new ArrayList<>();
+            long totalSize = 0;
+            try (Stream<Path> walk = Files.walk(cachePath)) {
+                Iterator<Path> it = walk.filter(Files::isRegularFile).iterator();
+                while (it.hasNext()) {
+                    Path p = it.next();
+                    long size = Files.size(p);
+                    totalSize += size;
+                    filesToDelete.add(p);
                 }
             }
-            JsonObject defaultConfig = new JsonObject();
-            defaultConfig.addProperty("cacheDir", "");
-            defaultConfig.addProperty("serveUrl", "");
-            defaultConfig.addProperty("ffmpegPath", "ffmpeg");
-            defaultConfig.addProperty("userAgent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
-            defaultConfig.addProperty("maxAudioLength", 45);
-            defaultConfig.addProperty("maxCacheSize", 100);
-
-            JsonObject adv = new JsonObject();
-            adv.addProperty("maxRetry", 3);
-            adv.addProperty("retryDelay", 1500);
-            adv.addProperty("quality", 6);
-            defaultConfig.add("advanced", adv);
-
-            try (FileWriter writer = new FileWriter(configFile)) {
-                writer.write(AllMusic.gson.toJson(defaultConfig));
+            long maxSizeBytes = maxCacheSize * 1024L * 1024L;
+            if (totalSize > maxSizeBytes) {
+                AllMusic.log.data("<light_purple>[BiliAPI]<yellow>缓存大小 " + (totalSize / 1024 / 1024) + " MB 超过限制 " + maxCacheSize + " MB，开始清理...");
+                int deleted = 0;
+                for (Path p : filesToDelete) {
+                    try {
+                        Files.delete(p);
+                        deleted++;
+                    } catch (IOException e) {
+                        AllMusic.log.data("<light_purple>[BiliAPI]<red>删除文件失败：" + p.getFileName() + " - " + e.toString());
+                    }
+                }
+                AllMusic.log.data("<light_purple>[BiliAPI]<yellow>缓存清理完成，共删除 " + deleted + " 个文件");
+            } else {
+                AllMusic.log.data("<light_purple>[BiliAPI]<yellow>缓存大小 " + (totalSize / 1024 / 1024) + " MB，未超过限制 " + maxCacheSize + " MB，无需清理");
             }
-        } catch (Exception e) {
-            AllMusic.log.data(LOG_PREFIX + "<red>重新生成 bili.json 失败：" + e.toString());
+        } catch (IOException e) {
+            AllMusic.log.data("<light_purple>[BiliAPI]<red>缓存清理失败：" + e.toString());
         }
     }
-
-    // ---------- 以下为原有方法（未改动） ----------
 
     @Override
     public String getId() {
@@ -350,23 +393,22 @@ public class BiliMusicApi implements IMusicApi {
 
     @Override
     public SongInfoObj getMusic(String id, String player, boolean isList) {
-        // 原样保留
         if (!configValid) {
-            AllMusic.log.data(LOG_PREFIX + "<red>API 未正确配置，拒绝处理请求");
+            AllMusic.log.data("<light_purple>[BiliAPI]<red>API 未正确配置，拒绝处理请求");
             if (player != null && !player.isEmpty()) {
                 Object sender = AllMusic.side.getPlayer(player);
                 if (sender != null) {
-                    AllMusic.side.sendMessage(sender, LOG_PREFIX + "<red>B站API未正确配置，请检查 bili.json");
+                    AllMusic.side.sendMessage(sender, "<light_purple>[BiliAPI]<red>B站API未正确配置，请检查 bili.json");
                 }
             }
             return null;
         }
         if (!checkId(id)) {
-            AllMusic.log.data(LOG_PREFIX + "<red>无效BV号：" + id);
+            AllMusic.log.data("<light_purple>[BiliAPI]<red>无效BV号：" + id);
             if (player != null && !player.isEmpty()) {
                 Object sender = AllMusic.side.getPlayer(player);
                 if (sender != null) {
-                    AllMusic.side.sendMessage(sender, LOG_PREFIX + "<red>无效的BV号：" + id);
+                    AllMusic.side.sendMessage(sender, "<light_purple>[BiliAPI]<red>无效的BV号：" + id);
                 }
             }
             return null;
@@ -375,11 +417,11 @@ public class BiliMusicApi implements IMusicApi {
         String url = BILI_API_BASE + "/x/web-interface/view?bvid=" + id;
         HttpResObj res = httpGet(url);
         if (res == null || !res.ok) {
-            AllMusic.log.data(LOG_PREFIX + "<red>获取视频信息失败：" + id);
+            AllMusic.log.data("<light_purple>[BiliAPI]<red>获取视频信息失败：" + id);
             if (player != null && !player.isEmpty()) {
                 Object sender = AllMusic.side.getPlayer(player);
                 if (sender != null) {
-                    AllMusic.side.sendMessage(sender, LOG_PREFIX + "<red>获取视频信息失败：" + id);
+                    AllMusic.side.sendMessage(sender, "<light_purple>[BiliAPI]<red>获取视频信息失败：" + id);
                 }
             }
             return null;
@@ -388,25 +430,26 @@ public class BiliMusicApi implements IMusicApi {
         try {
             JsonObject root = AllMusic.gson.fromJson(res.data, JsonObject.class);
             if (root.get("code").getAsInt() != 0) {
-                AllMusic.log.data(LOG_PREFIX + "<red>B站API返回错误：" + root.get("code").getAsInt());
+                AllMusic.log.data("<light_purple>[BiliAPI]<red>B站API返回错误：" + root.get("code").getAsInt());
                 if (player != null && !player.isEmpty()) {
                     Object sender = AllMusic.side.getPlayer(player);
                     if (sender != null) {
-                        AllMusic.side.sendMessage(sender, LOG_PREFIX + "<red>B站API返回错误：" + root.get("code").getAsInt());
+                        AllMusic.side.sendMessage(sender, "<light_purple>[BiliAPI]<red>B站API返回错误：" + root.get("code").getAsInt());
                     }
                 }
                 return null;
             }
             JsonObject data = root.getAsJsonObject("data");
             String name = data.get("title").getAsString();
-            long duration = data.get("duration").getAsLong();
+            long duration = data.get("duration").getAsLong(); // 单位：秒
 
+            // 检查时长限制
             if (maxAudioLength > 0 && duration > maxAudioLength * 60L) {
-                AllMusic.log.data(LOG_PREFIX + "<yellow>视频时长超过限制：" + duration + " 秒（限制 " + maxAudioLength + " 分钟）");
+                AllMusic.log.data("<light_purple>[BiliAPI]<yellow>视频时长超过限制：" + duration + " 秒（限制 " + maxAudioLength + " 分钟）");
                 if (player != null && !player.isEmpty()) {
                     Object sender = AllMusic.side.getPlayer(player);
                     if (sender != null) {
-                        AllMusic.side.sendMessage(sender, LOG_PREFIX + "<red>时长超过 " + maxAudioLength + " 分钟");
+                        AllMusic.side.sendMessage(sender, "<light_purple>[BiliAPI]<red>时长超过 " + maxAudioLength + " 分钟");
                     }
                 }
                 return null;
@@ -420,11 +463,11 @@ public class BiliMusicApi implements IMusicApi {
             return new SongInfoObj(author, name, id, "BV视频", player, "B站", isList,
                     duration * 1000L, pic, false, null, getId());
         } catch (Exception e) {
-            AllMusic.log.data(LOG_PREFIX + "<red>解析视频信息失败：" + e.toString());
+            AllMusic.log.data("<light_purple>[BiliAPI]<red>解析视频信息失败：" + e.toString());
             if (player != null && !player.isEmpty()) {
                 Object sender = AllMusic.side.getPlayer(player);
                 if (sender != null) {
-                    AllMusic.side.sendMessage(sender, LOG_PREFIX + "<red>解析视频信息失败：" + e.toString());
+                    AllMusic.side.sendMessage(sender, "<light_purple>[BiliAPI]<red>解析视频信息失败：" + e.toString());
                 }
             }
             return null;
@@ -433,13 +476,12 @@ public class BiliMusicApi implements IMusicApi {
 
     @Override
     public String getPlayUrl(String id) {
-        // 原样保留（未改动）
         if (!configValid) {
-            AllMusic.log.data(LOG_PREFIX + "<red>API 未正确配置，拒绝生成播放链接");
+            AllMusic.log.data("<light_purple>[BiliAPI]<red>API 未正确配置，拒绝生成播放链接");
             return null;
         }
         if (!checkId(id)) {
-            AllMusic.log.data(LOG_PREFIX + "<red>无效BV号：" + id);
+            AllMusic.log.data("<light_purple>[BiliAPI]<red>无效BV号：" + id);
             return null;
         }
 
@@ -454,13 +496,13 @@ public class BiliMusicApi implements IMusicApi {
 
             Long cid = fetchCid(id);
             if (cid == null) {
-                AllMusic.log.data(LOG_PREFIX + "<red>无法获取cid：" + id);
+                AllMusic.log.data("<light_purple>[BiliAPI]<red>无法获取cid：" + id);
                 return null;
             }
 
             String videoUrl = fetchVideoUrl(id, cid);
             if (videoUrl == null) {
-                AllMusic.log.data(LOG_PREFIX + "<red>无法获取视频播放地址：" + id);
+                AllMusic.log.data("<light_purple>[BiliAPI]<red>无法获取视频播放地址：" + id);
                 return null;
             }
 
@@ -468,7 +510,7 @@ public class BiliMusicApi implements IMusicApi {
             Path outMp3 = cachePath.resolve(id + ".out.mp3");
 
             if (!downloadFile(videoUrl, tmpMp4)) {
-                AllMusic.log.data(LOG_PREFIX + "<red>下载MP4失败：" + id);
+                AllMusic.log.data("<light_purple>[BiliAPI]<red>下载MP4失败：" + id);
                 return null;
             }
 
@@ -482,7 +524,7 @@ public class BiliMusicApi implements IMusicApi {
             return serveUrl + mp3Name;
 
         } catch (IOException e) {
-            AllMusic.log.data(LOG_PREFIX + "<red>处理音频文件时发生IO错误：" + e.toString());
+            AllMusic.log.data("<light_purple>[BiliAPI]<red>处理音频文件时发生IO错误：" + e.toString());
             return null;
         } finally {
             try {
@@ -499,9 +541,8 @@ public class BiliMusicApi implements IMusicApi {
 
     @Override
     public SearchPageObj search(String[] args) {
-        // 原样保留
         if (!configValid) {
-            AllMusic.log.data(LOG_PREFIX + "<red>API 未正确配置，拒绝搜索");
+            AllMusic.log.data("<light_purple>[BiliAPI]<red>API 未正确配置，拒绝搜索");
             return null;
         }
 
@@ -539,7 +580,7 @@ public class BiliMusicApi implements IMusicApi {
                 return new SearchPageObj(resultList, totalPages, getId());
 
             } catch (Exception e) {
-                AllMusic.log.data(LOG_PREFIX + "<yellow>搜索请求失败 (尝试 " + (attempt + 1) + "/" + maxRetry + ")：" + e.toString());
+                AllMusic.log.data("<light_purple>[BiliAPI]<yellow>搜索请求失败 (尝试 " + (attempt + 1) + "/" + maxRetry + ")：" + e.toString());
             }
 
             if (attempt < maxRetry - 1) {
@@ -552,19 +593,19 @@ public class BiliMusicApi implements IMusicApi {
             }
         }
 
-        AllMusic.log.data(LOG_PREFIX + "<red>搜索失败，关键词：" + keyword);
+        AllMusic.log.data("<light_purple>[BiliAPI]<red>搜索失败，关键词：" + keyword);
         return new SearchPageObj(resultList, 0, getId());
     }
 
     @Override
     public void setList(String id, Object sender) {
         if (!configValid) {
-            AllMusic.log.data(LOG_PREFIX + "<red>API 未正确配置，拒绝操作");
-            AllMusic.side.sendMessage(sender, LOG_PREFIX + "<red>B站API未正确配置，请检查 bili.json");
+            AllMusic.log.data("<light_purple>[BiliAPI]<red>API 未正确配置，拒绝操作");
+            AllMusic.side.sendMessage(sender, "<light_purple>[BiliAPI]<red>B站API未正确配置，请检查 bili.json");
             return;
         }
-        AllMusic.log.data(LOG_PREFIX + "<yellow>B站源暂不支持歌单");
-        AllMusic.side.sendMessage(sender, LOG_PREFIX + "<red>B站暂不支持歌单功能");
+        AllMusic.log.data("<light_purple>[BiliAPI]<yellow>B站源暂不支持歌单");
+        AllMusic.side.sendMessage(sender, "<light_purple>[BiliAPI]<red>B站暂不支持歌单功能");
     }
 
     @Override
@@ -577,72 +618,11 @@ public class BiliMusicApi implements IMusicApi {
         return new ArrayList<>();
     }
 
-    // ---------- 私有辅助方法（未改动） ----------
+    // ========== 私有辅助方法 ==========
 
     private String normalizeUrl(String url) {
         if (url == null || url.isEmpty()) return url;
         return url.endsWith("/") ? url : url + "/";
-    }
-
-    private Path getCachePath() {
-        Path path = Paths.get(cacheDir);
-        if (!path.isAbsolute()) {
-            path = Paths.get(System.getProperty("user.dir")).resolve(path);
-        }
-        return path.toAbsolutePath().normalize();
-    }
-
-    private boolean checkFfmpeg() {
-        try {
-            ProcessBuilder pb = new ProcessBuilder(ffmpegPath, "-version");
-            pb.redirectErrorStream(true);
-            Process process = pb.start();
-            int exitCode = process.waitFor();
-            if (exitCode == 0) {
-                AllMusic.log.data(LOG_PREFIX + "<yellow>ffmpeg 检查通过：" + ffmpegPath);
-                return true;
-            } else {
-                AllMusic.log.data(LOG_PREFIX + "<red>ffmpeg 执行失败，退出码：" + exitCode);
-                return false;
-            }
-        } catch (IOException | InterruptedException e) {
-            AllMusic.log.data(LOG_PREFIX + "<red>ffmpeg 不可用：" + e.toString());
-            return false;
-        }
-    }
-
-    private void cleanupCache(Path cachePath) {
-        try {
-            List<Path> filesToDelete = new ArrayList<>();
-            long totalSize = 0;
-            try (Stream<Path> walk = Files.walk(cachePath)) {
-                Iterator<Path> it = walk.filter(Files::isRegularFile).iterator();
-                while (it.hasNext()) {
-                    Path p = it.next();
-                    long size = Files.size(p);
-                    totalSize += size;
-                    filesToDelete.add(p);
-                }
-            }
-            long maxSizeBytes = maxCacheSize * 1024L * 1024L;
-            if (totalSize > maxSizeBytes) {
-                AllMusic.log.data(LOG_PREFIX + "<yellow>缓存大小 " + (totalSize / 1024 / 1024) + " MB 超过限制 " + maxCacheSize + " MB，开始清理...");
-                int deleted = 0;
-                for (Path p : filesToDelete) {
-                    try {
-                        Files.delete(p);
-                        deleted++;
-                    } catch (IOException e) {
-                        AllMusic.log.data(LOG_PREFIX + "<red>删除文件失败：" + p.getFileName() + " - " + e.toString());
-                    }
-                }
-                AllMusic.log.data(LOG_PREFIX + "<yellow>缓存清理完成，共删除 " + deleted + " 个文件");
-            } else {
-                AllMusic.log.data(LOG_PREFIX + "<yellow>缓存大小 " + (totalSize / 1024 / 1024) + " MB，未超过限制 " + maxCacheSize + " MB，无需清理");
-            }
-        } catch (IOException e) {
-            AllMusic.log.data(LOG_PREFIX + "<red>缓存清理失败：" + e.toString());
-        }
     }
 
     private Long fetchCid(String bvid) {
@@ -653,7 +633,7 @@ public class BiliMusicApi implements IMusicApi {
             JsonObject root = AllMusic.gson.fromJson(res.data, JsonObject.class);
             return root.getAsJsonObject("data").get("cid").getAsLong();
         } catch (Exception e) {
-            AllMusic.log.data(LOG_PREFIX + "<red>获取cid失败：" + e.toString());
+            AllMusic.log.data("<light_purple>[BiliAPI]<red>获取cid失败：" + e.toString());
             return null;
         }
     }
@@ -671,7 +651,7 @@ public class BiliMusicApi implements IMusicApi {
                 return durl.get(0).getAsJsonObject().get("url").getAsString();
             }
         } catch (Exception e) {
-            AllMusic.log.data(LOG_PREFIX + "<red>解析视频播放地址失败：" + e.toString());
+            AllMusic.log.data("<light_purple>[BiliAPI]<red>解析视频播放地址失败：" + e.toString());
         }
         return null;
     }
@@ -687,7 +667,7 @@ public class BiliMusicApi implements IMusicApi {
 
             int code = conn.getResponseCode();
             if (code != 200 && code != 206) {
-                AllMusic.log.data(LOG_PREFIX + "<red>下载失败，HTTP " + code + " from " + url);
+                AllMusic.log.data("<light_purple>[BiliAPI]<red>下载失败，HTTP " + code + " from " + url);
                 return false;
             }
 
@@ -696,7 +676,7 @@ public class BiliMusicApi implements IMusicApi {
             }
             return Files.exists(target) && Files.size(target) > 0;
         } catch (Exception e) {
-            AllMusic.log.data(LOG_PREFIX + "<red>下载文件失败：" + e.toString());
+            AllMusic.log.data("<light_purple>[BiliAPI]<red>下载文件失败：" + e.toString());
             return false;
         }
     }
@@ -725,11 +705,11 @@ public class BiliMusicApi implements IMusicApi {
             if (exit == 0 && Files.exists(output) && Files.size(output) > 1000) {
                 return true;
             } else {
-                AllMusic.log.data(LOG_PREFIX + "<red>ffmpeg转码失败，退出码：" + exit);
+                AllMusic.log.data("<light_purple>[BiliAPI]<red>ffmpeg转码失败，退出码：" + exit);
                 return false;
             }
         } catch (Exception e) {
-            AllMusic.log.data(LOG_PREFIX + "<red>ffmpeg执行异常：" + e.toString());
+            AllMusic.log.data("<light_purple>[BiliAPI]<red>ffmpeg执行异常：" + e.toString());
             return false;
         }
     }
@@ -759,26 +739,12 @@ public class BiliMusicApi implements IMusicApi {
                 return new HttpResObj(sb.toString(), true);
             }
         } catch (Exception e) {
-            AllMusic.log.data(LOG_PREFIX + "<red>HTTP GET 失败：" + e.toString());
+            AllMusic.log.data("<light_purple>[BiliAPI]<red>HTTP GET 失败：" + e.toString());
             return new HttpResObj("", false);
         }
     }
 
     private String stripHtml(String input) {
         return input.replaceAll("<[^>]+>", "");
-    }
-
-    // ---------- 内部配置值对象 ----------
-    private static class BiliConfig {
-        String cacheDir;
-        String serveUrl;
-        String ffmpegPath;
-        String userAgent;
-        int maxAudioLength;
-        int maxCacheSize;
-        int quality;
-        int maxRetry;
-        long retryDelay;
-        boolean valid;
     }
 }
