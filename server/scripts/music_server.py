@@ -4,6 +4,7 @@ import http.server
 import os
 
 PORT = 8090
+#如果你没有修改bili.json里的cacheDir,这里应该的DIR填你与你服务端同级的music_cache文件夹的路径，否则跟cacheDir填成一样
 DIR = '/home/minecraft/music_cache'
 
 os.chdir(DIR)
