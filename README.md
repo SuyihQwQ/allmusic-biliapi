@@ -141,13 +141,13 @@ allmusic-bilibili/
 Linux / macOS
 
 ```bash
-javac -cp "AllMusic_Server.jar:gson.jar:adventure-api.jar" -encoding UTF-8 -d out server/src/main/java/bili/BiliMusicApi.java && cp server/src/main/resources/version out/ && cd out && jar cf ../bili-api.jar . && cd ..
+javac -cp "AllMusic_Server.jar:gson.jar:adventure-api.jar" -encoding UTF-8 -d out server/src/main/java/bili/*.java && cp server/src/main/resources/version out/ && cd out && jar cf ../bili-api.jar . && cd ..
 ```
 
 Windows
 
 ```cmd
-javac -cp "AllMusic_Server.jar;gson.jar;adventure-api.jar" -encoding UTF-8 -d out server\src\main\java\bili\BiliMusicApi.java && copy server\src\main\resources\version out\ && cd out && jar cf ..\bili-api.jar . && cd ..
+javac -cp "AllMusic_Server.jar;gson.jar;adventure-api.jar" -encoding UTF-8 -d out server\src\main\java\bili\*.java && copy server\src\main\resources\version out\ && cd out && jar cf ..\bili-api.jar . && cd ..
 ```
 
 ### 2. 放入 AllMusic 的 api 目录
