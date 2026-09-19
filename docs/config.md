@@ -6,6 +6,8 @@
 <server>/plugins/allmusic/api/bili.json
 ```
 
+构建产物不绑定特定的 AllMusic 服务端版本，可放入任意兼容的 AllMusic 服务端运行。项目 `libs/` 中的宿主 API JAR 仅用于编译，运行时由目标 AllMusic 服务端提供实际宿主环境。
+
 修改配置后执行 `/music reload`；也可以重启 Paper。配置文件不存在或 JSON 格式错误时，API 会备份损坏文件并生成默认配置。升级旧版本时，如果检测到缺少新版配置项，API 会自动补齐并写回 `bili.json`，不会覆盖已有配置值。
 
 ## 推荐配置

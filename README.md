@@ -35,7 +35,7 @@ B 站在部分云服务器网络环境下无法稳定提供 DASH 纯音频流，
 
 ## 前置要求
 
-- Paper 服务器和 AllMusic 4.x。
+- Paper 服务器和任意兼容的 AllMusic 服务端。
 - Java 21 或更高版本。
 - ffmpeg，并确保服务进程可以执行 `ffmpeg -version`。
 
@@ -43,13 +43,13 @@ B 站在部分云服务器网络环境下无法稳定提供 DASH 纯音频流，
 
 ### 1. 准备依赖
 
-项目已包含从 `netapi` 获取的 AllMusic 宿主 API，构建会直接使用项目内 `libs/` 目录中的 JAR：
+项目已包含从 `netapi` 获取的 AllMusic 宿主 API，构建会直接使用项目内 `libs/` 目录中的 JAR。该文件只用于编译，构建产物经过实测可在任意兼容的 AllMusic 服务端运行，不要求服务端必须使用相同版本的宿主 JAR：
 
 ```text
 libs/server-4.2.0-all.jar
 ```
 
-`gson` 和 Adventure API 由 Gradle 从配置的 Maven 镜像下载。宿主 API 不会在构建时联网下载；如果宿主版本更新，请同步替换 `libs/server-4.2.0-all.jar`。
+`gson` 和 Adventure API 由 Gradle 从配置的 Maven 镜像下载。宿主 API 不会在构建时联网下载；只有在需要重新编译或使用新的 API 时，才需要替换 `libs/server-4.2.0-all.jar`。
 
 ### 2. 构建 API
 
