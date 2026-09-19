@@ -1,0 +1,32 @@
+plugins {
+    id 'java'
+}
+
+group = 'bili'
+version = '1.0.0'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+repositories {
+    maven { url = uri('https://mirrors.cloud.tencent.com/repository/maven-public/') }
+    mavenCentral()
+}
+
+dependencies {
+    compileOnly fileTree(dir: 'libs', include: ['*.jar'])
+    compileOnly "com.google.code.gson:gson:2.14.0"
+    compileOnly "net.kyori:adventure-api:4.26.1"
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = 21
+}
+
+tasks.jar {
+    archiveFileName = 'bili-api.jar'
+}

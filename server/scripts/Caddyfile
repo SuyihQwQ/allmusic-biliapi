@@ -1,7 +1,0 @@
-# Caddy 配置：/music/* 反代到本地音乐服务，复用 443 HTTPS
-map.yarinaoshi.top {
-	handle_path /music/* {
-		reverse_proxy 127.0.0.1:8090
-	}
-	reverse_proxy 127.0.0.1:8080
-}

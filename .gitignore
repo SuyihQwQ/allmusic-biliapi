@@ -1,11 +1,14 @@
 # Build artifacts
 *.class
 *.jar
+!libs/
+!libs/*.jar
 out/
 out2/
 out3/
 out4/
 build/
+.gradle/
 
 # IDE
 .idea/

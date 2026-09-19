@@ -1,260 +1,233 @@
 # AllMusic Bilibili 音乐源
-# Windows用户请仔细查看配置介绍！！！！！！
 
-让 [AllMusic](https://github.com/Coloryr/AllMusic) 插件支持 **Bilibili 视频点歌** 的完整解决方案。
+为 [AllMusic](https://github.com/Coloryr/AllMusic) 提供 B 站视频搜索、点歌和音频播放能力。
 
-> **背景**：AllMusic 官方只有网易云源（netapi），但网易云 weapi 接口对**云服务器 IP** 有风控（HTTP 200 返回空）。B 站虽然 API 可用，但 **DASH 纯音频接口对数据中心 IP 同样限流**（`fnval=16` 拿不到 audio），只能拿到**含视频轨的混合 MP4**——AllMusic 客户端（按纯音频设计）解不了这种文件。
+## 目录
 
-**本项目解决了什么**：
+- [特性和工作流程](#特性和工作流程)
+- [快速开始](#快速开始)
+- [配置摘要](#配置摘要)
+- [HTTP 音频服务](#http-音频服务)
+- [故障排查](#故障排查)
 
-1. 自研 AllMusic 音乐源 `BiliMusicApi`，实现 B 站视频搜索/解析/点歌
-2. 服务端 **ffmpeg 转码**：把 B 站混合 MP4 转成纯 MP3，绕开"客户端解不了混合 MP4"的难题
-3. 配套 HTTP 服务 + Caddy 反代，给客户端提供 HTTPS 音频流
+## 特性
 
----
+- 使用 B 站搜索 API 查找视频并返回 AllMusic 搜索结果。
+- 服务端使用 ffmpeg 将 B 站混合 MP4 转换为纯 MP3。
+- MP3 文件写入本地缓存，重复点歌无需再次下载和转码。
+- 支持 Linux、macOS 和 Windows。
+- 支持配置重载、缓存大小限制、音频时长限制和详细调试日志。
+- 通过插件内置 HTTP 服务直接向客户端提供音频文件，不提供反向代理或 HTTPS。
 
-## 架构
-
-```mermaid
-graph TB
-    subgraph Client["🎮 玩家客户端"]
-        A["Fabric + AllMusic_Client"]
-    end
-
-    subgraph Server["🖥️ Paper 服务器"]
-        B["AllMusic 插件"]
-        C["BiliMusicApi<br/>(自研 B 站音乐源)"]
-        D["ffmpeg 转码<br/>MP4 → MP3"]
-    end
-
-    subgraph Bilibili["📺 B 站 API"]
-        E["搜索 API"]
-        F["视频解析 API"]
-        G["视频下载 durl"]
-    end
-
-    subgraph ReverseProxy["🔄 反向代理"]
-        H["Caddy (443)"]
-        I["Python http.server (8090)"]
-    end
-
-    subgraph Storage["💾 存储"]
-        J["music_cache/*.mp3"]
-    end
-
-    A -->|"/music search 歌名"| B
-    B --> C
-    C -->|1. 调用搜索/解析<br/>带 UA + Referer| E
-    C -->|2. 获取视频信息| F
-    C -->|3. 下载混合 MP4<br/>~10MB, 6s| G
-    C -->|4. 转码| D
-    D -->|存入缓存| J
-    C -->|5. 返回 URL| H
-    H -->|handle_path /music/*| I
-    I -->|静态文件服务| J
-    A -->|6. 请求音频流<br/>HTTPS| H
-    H -->|7. 返回 MP3| A
-
-    style Client fill:#e1f5fe
-    style Server fill:#f3e5f5
-    style Bilibili fill:#fff3e0
-    style ReverseProxy fill:#e8f5e9
-    style Storage fill:#fce4ec
-```
-
-<details>
-<summary>📊 简化流程图</summary>
+## 工作流程
 
 ```mermaid
-sequenceDiagram
-    participant P as 玩家客户端
-    participant S as Paper 服务器
-    participant B as B 站 API
-    participant F as ffmpeg
-    participant C as Caddy/HTTP
-
-    P->>S: /music search 晴天
-    S->>B: 搜索视频
-    B-->>S: 视频列表
-    S-->>P: 显示搜索结果
-
-    P->>S: /music 1
-    S->>B: 解析视频地址
-    B-->>S: durl 混合 MP4
-    S->>B: 下载 MP4 (~10MB)
-    B-->>S: MP4 数据
-    S->>F: 转码 MP4 → MP3
-    F-->>S: MP3 文件 (~3MB)
-    S->>S: 存入缓存目录
-    S-->>P: 返回 https://域名/music/bvid.mp3
-
-    P->>C: 请求音频流
-    C->>C: 读取缓存 MP3
-    C-->>P: 返回 MP3 数据流
-    P->>P: 播放音乐 🎵
+flowchart LR
+    C[AllMusic 客户端] --> S[Paper + BiliMusicApi]
+    S --> B[B 站 API]
+    S --> D[下载混合 MP4]
+    D --> F[ffmpeg 转码 MP3]
+    F --> M[(music_cache)]
+    C -->|HTTP 音频请求| S
 ```
 
-</details>
+B 站在部分云服务器网络环境下无法稳定提供 DASH 纯音频流，因此本项目采用“下载混合 MP4 → 服务端转码”的方案。客户端最终只接收 MP3，兼容性更好。
 
-**关键决策**：
+## 前置要求
 
-- **为什么不用 DASH 纯音频**：B 站对数据中心 IP 的 DASH 接口限流（和网易云 weapi 一样），试了 `fnval=16/80/4048`、带 cookie、各种 UA 都拿不到 `audio`，只稳定返回 durl 混合 MP4
-- **为什么服务端转码**：AllMusic 客户端 M4ADecoder 解含视频帧的混合 MP4 会错位（`invalid huffman codebook: 12`），且 `skip()` 跳视频块会断流。服务端转成纯 MP3 是最可靠的解法
-- **为什么复用 443**：腾讯云安全组新增端口麻烦，用 Caddy `handle_path /music/*` 反代到本地 8090，客户端走已有 HTTPS
+- Paper 服务器和 AllMusic 4.x。
+- Java 21 或更高版本。
+- ffmpeg，并确保服务进程可以执行 `ffmpeg -version`。
 
----
+## 快速开始
 
-## 项目结构
+### 1. 准备依赖
 
-```
-allmusic-bilibili/
-├── docs
-│   └── config.md
-├── LICENSE
-├── README.md
-└── server
-    ├── scripts
-    │   ├── Caddyfile
-    │   └── music_server.py
-    └── src
-        └── main
-            ├── java
-            │   └── bili
-            │       └── BiliMusicApi.java
-            └── resources
-                └── version
+项目已包含从 `netapi` 获取的 AllMusic 宿主 API，构建会直接使用项目内 `libs/` 目录中的 JAR：
+
+```text
+libs/server-4.2.0-all.jar
 ```
 
-## 部署步骤
+`gson` 和 Adventure API 由 Gradle 从配置的 Maven 镜像下载。宿主 API 不会在构建时联网下载；如果宿主版本更新，请同步替换 `libs/server-4.2.0-all.jar`。
 
-### 前置要求
+### 2. 构建 API
 
-- Paper 26.1.2（AllMusic 4.x）服务器
-- Java 17+ 和 Python
-- **ffmpeg**（服务端转码用）：`sudo apt install ffmpeg`
-- （可选）Caddy（或任意反代）：`sudo apt install caddy`
-
-### 1. 构建 B 站音乐源 jar
-
-依赖：AllMusic server jar（`[paper]AllMusic_Server-*.jar`）+ gson + adventure-api
-
-Linux / macOS
+Linux/macOS：
 
 ```bash
-javac -cp "AllMusic_Server.jar:gson.jar:adventure-api.jar" -encoding UTF-8 -d out server/src/main/java/bili/*.java && cp server/src/main/resources/version out/ && cd out && jar cf ../bili-api.jar . && cd ..
+./gradlew clean build
 ```
 
-Windows
+Windows：
 
-```cmd
-javac -cp "AllMusic_Server.jar;gson.jar;adventure-api.jar" -encoding UTF-8 -d out server\src\main\java\bili\*.java && copy server\src\main\resources\version out\ && cd out && jar cf ..\bili-api.jar . && cd ..
+```bat
+gradlew.bat clean build
 ```
 
-### 2. 放入 AllMusic 的 api 目录
+构建产物：
+
+```text
+build/libs/bili-api.jar
+```
+
+Gradle Wrapper 会自动下载 Gradle，不需要单独安装 Gradle。
+
+### 3. 安装 API
+
+将构建产物复制到 AllMusic 的 API 目录：
 
 ```bash
-cp bili-api.jar <server>/plugins/allmusic/api/
+cp build/libs/bili-api.jar <server>/plugins/allmusic/api/
 ```
 
-Win用鼠标拖一下就行了()
+Windows 可以直接复制文件。
 
-### 3. 配置
+### 4. 配置 BiliMusicApi
 
-- [详细配置介绍](https://github.com/su-yihong/allmusic-bilibili/blob/master/docs/config.md)
+启动一次 Paper 后编辑：
 
-### 4. 音乐 HTTP 服务
-
-```bash
-# 复制脚本，改端口/目录后注册为 systemd 服务
-python3 server/scripts/music_server.py
+```text
+<server>/plugins/allmusic/api/bili.json
 ```
 
-systemd 服务示例：
+至少填写 `serveUrl`。完整配置和 Windows 路径示例见 [配置说明](docs/config.md)。
 
-```ini
-[Unit]
-Description=Music HTTP Server for AllMusic
-After=network.target
+### 5. 配置 HTTP 音频服务
 
-[Service]
-Type=simple
-User=minecraft
-Group=minecraft
-WorkingDirectory=/home/minecraft
-ExecStart=/usr/bin/python3 /home/minecraft/music_server.py
-Restart=on-failure
+插件会将 `cacheDir` 根目录中的 MP3 文件通过内置 HTTP 服务提供出来。服务默认监听 `0.0.0.0:8090`，客户端访问格式为：
 
-[Install]
-WantedBy=multi-user.target
+```json
+"serveUrl": "http://your-public-ip:8090/"
 ```
 
-### 5. Caddy 反代
+最终音频地址为 `http://your-public-ip:8090/BVxxxx.mp3`。如果修改 `port`，`serveUrl` 的端口也必须同步修改。服务只允许根路径 MP3 文件，不提供目录浏览、路径前缀、反向代理或 HTTPS。
 
-参考 `server/scripts/Caddyfile`：
-
-```caddy
-your-domain.com {
-	handle_path /music/* {
-		reverse_proxy 127.0.0.1:8090
-	}
-	reverse_proxy 127.0.0.1:8080   # 你的其他服务
-}
-```
-
-### 6. 配置默认音乐源
+### 6. 设置默认音乐源
 
 编辑 `<server>/plugins/allmusic/config.json`：
 
 ```json
-{ "defaultApi": "bili" }
+{
+  "defaultApi": "bili"
+}
 ```
 
-### 7. 重启服务器
+重启 Paper，确认控制台出现类似：
 
-重启 Paper 让 AllMusic 重新扫描 api 目录：
-
-验证：控制台日志应出现 `[AllMusic]注册音乐API：bili`
-
+```text
+[AllMusic]注册音乐API：bili
+```
 
 ## 使用
 
-玩家装好 Fabric + AllMusic Client mod 后，进服：
+玩家安装 Fabric + AllMusic Client 后，可以使用：
 
+```text
+/music search 歌名
+/music <搜索结果编号>
+/music list
+/music stop
+/music vote
 ```
-/music search 歌名      # 搜 B 站视频
-/music <数字>            # 点歌（第一首要等 ~12秒，含下载+转码）
-/music list / stop / vote  # 播放控制
+
+首次点歌需要下载和转码，之后相同 BV 号会直接命中 MP3 缓存。
+
+## 配置摘要
+
+常用配置示例：
+
+```json
+{
+  "cacheDir": "music_cache",
+  "serveUrl": "http://your-public-ip:8090/",
+  "port": 8090,
+  "cleanupInterval": 60,
+  "ffmpegPath": "ffmpeg",
+  "maxAudioLength": 45,
+  "maxCacheSize": 512,
+  "quality": 6,
+  "advanced": {
+    "configVersion": 2,
+    "debug": false,
+    "listenAddresses": ["0.0.0.0"],
+    "preserveMinutes": 5,
+    "maxRetry": 3,
+    "retryDelay": 1500
+  }
+}
 ```
 
-> 同曲目二次点歌**秒回**（已缓存 MP3）。
+排查问题时临时开启：
 
----
+```json
+"advanced": {
+  "debug": true
+}
+```
+
+修改后执行：
+
+```text
+/music reload
+```
+
+详细字段说明、启动条件和排障方法见 [docs/config.md](docs/config.md)。
+
+## HTTP 音频服务
+
+- `port` 默认 `8090`，非法值回退到 `8090`。
+- `advanced.listenAddresses` 支持多个监听地址，默认 `["0.0.0.0"]`。
+- `serveUrl` 必须是客户端可直连的 HTTP/HTTPS 根地址，并以 `/` 结尾。
+- 使用 Cloudflare Tunnel 时，`serveUrl` 应填写 Tunnel 暴露的公网根地址，例如 `https://music.example.com/`；Tunnel 需要转发到插件监听端口。
+- 项目不负责 TLS 终止、反向代理、鉴权或目录索引。
+
+## 缓存和配置升级
+
+- `maxCacheSize` 默认 `512 MB`，设置为 `0` 表示不限制。
+- `cleanupInterval` 默认每 `60` 分钟执行一次清理。
+- 启动和 `/music reload` 时会立即清理一次。
+- `advanced.preserveMinutes` 默认保留最近 `5` 分钟内修改的 MP3。
+- `advanced.configVersion` 由插件维护，缺失或不匹配时会递归补齐缺失配置并写回文件，不覆盖已有值。
+
+## 故障排查
+
+- **API 未加载**：检查 `serveUrl`、ffmpeg、缓存目录权限和 HTTP 端口占用。
+- **访问返回 404**：确认 URL 是 `/BVxxxx.mp3`，不要添加 `/music` 等路径前缀。
+- **首次播放较慢**：首次需要下载 MP4 并使用 ffmpeg 转码，之后会命中缓存。
+- **搜索失败或限流**：适当增加 `advanced.maxRetry` 或 `advanced.retryDelay`，并临时开启 `advanced.debug`。
+- **调试结束后**：将 `advanced.debug` 改回 `false` 并执行 `/music reload`。
 
 ## 已知限制
 
-- **点歌首次有延迟**：服务端要下载 MP4（~6s）+ 转码（~6s），第一首约 12 秒后开始播
-- **搜索有频率限制**：B 站搜索 API 对连续请求限流，已内置 4 次重试 + 1.5s 间隔
-- **`/music test` 会卡主线程**：AllMusic 的 CommandTest 同步调 getPlayUrl，转码时主线程阻塞触发 Paper watchdog（真实播放走异步线程不受影响）
-- **B 站无歌词**：`getLyric` 返回空
-- **B 站无歌单**：`setList` 暂不支持
+- 首次点歌需要下载和转码，耗时取决于视频大小、网络和 CPU。
+- B 站搜索接口可能限流，项目提供可配置的重试次数和间隔。
+- `/music test` 可能同步执行转码并阻塞主线程，建议使用真实播放流程验证。
+- B 站音乐源暂不提供歌词和歌单。
+- 不同网络环境下 B 站接口或视频地址可能出现限流、超时或不可达。
 
----
+## 项目结构
 
-## 本Fork的修改
+```text
+allmusic-bilibili/
+├── build.gradle
+├── settings.gradle
+├── libs/
+│   └── server-4.2.0-all.jar
+├── gradlew
+├── gradlew.bat
+├── docs/
+│   └── config.md
+├── src/main/
+│   ├── java/bili/
+│   └── resources/version
+└── README.md
+```
 
-- 1.环境变量改成配置文件
-- 2.增加缓存清理功能
-- 3.增加可点视频时长限制，以免过长的音频导致一直卡在转码
-- 4.让转码质量能够直接在配置修改，以免糟糕的音质伤害人耳
-- 5.Win上也能用
+## 许可证和相关项目
 
-## License
+本项目使用 MIT License。
 
-MIT
-
-## 相关
-
-- [AllMusic (Coloryr/AllMusic)](https://github.com/Coloryr/AllMusic)
+- [AllMusic](https://github.com/Coloryr/AllMusic)
 - [netapi 网易云源](https://github.com/Coloryr/netapi)
 - [AllMusic-Bilibili](https://github.com/xiaozhang0406/allmusic-bilibili)
-
