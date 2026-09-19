@@ -49,7 +49,7 @@ B 站在部分云服务器网络环境下无法稳定提供 DASH 纯音频流，
 libs/server-4.2.0-all.jar
 ```
 
-`gson` 和 Adventure API 由 Gradle 从配置的 Maven 镜像下载。宿主 API 不会在构建时联网下载；只有在需要重新编译或使用新的 API 时，才需要替换 `libs/server-4.2.0-all.jar`。
+当前构建只需要项目内的 `libs/server-4.2.0-all.jar`，不需要额外准备 Gson 或 Adventure API 文件。只有在需要重新编译或使用新的宿主 API 时，才需要替换该 JAR。
 
 ### 2. 构建 API
 
