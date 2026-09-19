@@ -124,7 +124,7 @@ Windows 可以直接复制文件。
 玩家安装 Fabric + AllMusic Client 后，可以使用：
 
 ```text
-/music search 歌名
+/music searchapi bili 歌名
 /music <搜索结果编号>
 /music list
 /music stop
