@@ -4,4 +4,4 @@ pluginManagement {
     }
 }
 
-rootProject.name = 'allmusic-bilibili'
+rootProject.name = 'allmusic-biliapi'

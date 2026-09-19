@@ -1,4 +1,4 @@
-# AllMusic Bilibili 音乐源
+# AllMusic BiliAPI
 
 为 [AllMusic](https://github.com/Coloryr/AllMusic) 提供 B 站视频搜索、点歌和音频播放能力。
 
@@ -209,7 +209,7 @@ Windows 可以直接复制文件。
 ## 项目结构
 
 ```text
-allmusic-bilibili/
+allmusic-biliapi/
 ├── build.gradle
 ├── settings.gradle
 ├── libs/
@@ -230,4 +230,4 @@ allmusic-bilibili/
 
 - [AllMusic](https://github.com/Coloryr/AllMusic)
 - [netapi 网易云源](https://github.com/Coloryr/netapi)
-- [AllMusic-Bilibili](https://github.com/xiaozhang0406/allmusic-bilibili)
+- AllMusic BiliAPI
