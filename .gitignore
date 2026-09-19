@@ -3,6 +3,9 @@
 *.jar
 !libs/
 !libs/*.jar
+!gradle/
+!gradle/wrapper/
+!gradle/wrapper/*.jar
 out/
 out2/
 out3/
