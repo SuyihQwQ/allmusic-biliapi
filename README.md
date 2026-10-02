@@ -16,7 +16,7 @@
 ./gradlew clean build
 ```
 
-Windows 使用 `gradlew.bat clean build`。将 `build/libs/bili-api.jar` 放入：
+Windows 使用 `gradlew.bat clean build`。将 `build/libs/bili-api-3.0.jar` 放入：
 
 ```text
 <server>/plugins/allmusic/api/
