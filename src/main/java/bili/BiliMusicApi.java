@@ -31,6 +31,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -38,17 +39,17 @@ import java.util.Set;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Stream;
 
 public class BiliMusicApi implements IMusicApi {
 
     private static final String BILI_API_BASE = "https://api.bilibili.com";
-    private static final int CONFIG_VERSION = 3;
-    private static final int PREVIOUS_CONFIG_VERSION = 4;
-    private static final long PREVIOUS_DEFAULT_TRANSCODE_MIN_TIMEOUT_SECONDS = 120L;
-    private static final double PREVIOUS_DEFAULT_TRANSCODE_DURATION_MULTIPLIER = 3.0;
+    private static final int CONFIG_VERSION = 4;
     private static final long DEFAULT_TRANSCODE_MIN_TIMEOUT_SECONDS = 60L;
     private static final double DEFAULT_TRANSCODE_DURATION_MULTIPLIER = 0.75;
+    private static final long SHUTDOWN_TIMEOUT_SECONDS = 10L;
+    private static final int PLAY_LOCK_COUNT = 64;
     private static final String DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
     private static final String DEFAULT_CACHE_DIR = "music_cache";
     private static final String DEFAULT_STREAM_MODE = "dash";
@@ -71,6 +72,7 @@ public class BiliMusicApi implements IMusicApi {
     private long retryDelay = 1500L;
     private String userAgent = DEFAULT_USER_AGENT;
     private boolean debugEnabled;
+    private boolean httpServerEnabled = true;
     private List<String> listenAddresses = List.of("0.0.0.0");
     private long preserveMinutes = 5L;
     private String streamMode = DEFAULT_STREAM_MODE;
@@ -78,18 +80,86 @@ public class BiliMusicApi implements IMusicApi {
     private double transcodeDurationMultiplier = DEFAULT_TRANSCODE_DURATION_MULTIPLIER;
     private BiliStreamProvider streamProvider;
 
-    private volatile boolean isUpdate;
-    private boolean configValid = false;
+    private final Object lifecycleLock = new Object();
+    private final Set<ActivePlayTask> activePlayTasks = new HashSet<>();
+    private final ThreadLocal<ActivePlayTask> currentPlayTask = new ThreadLocal<>();
+    private final ReentrantLock[] playLocks = createPlayLocks();
+    private volatile boolean configValid = false;
+    private boolean reloading;
     private File configFile;
     private Path effectiveCachePath;
     private BiliHttpServer fileServer;
     private ScheduledExecutorService cleanupExecutor;
 
+    private static final class ActivePlayTask {
+        private final Thread thread = Thread.currentThread();
+        private volatile boolean cancelled;
+        private HttpURLConnection connection;
+        private Process process;
+
+        private synchronized void attachConnection(HttpURLConnection connection) {
+            if (cancelled) {
+                connection.disconnect();
+            } else {
+                this.connection = connection;
+            }
+        }
+
+        private synchronized void detachConnection(HttpURLConnection connection) {
+            if (this.connection == connection) {
+                this.connection = null;
+            }
+        }
+
+        private synchronized void attachProcess(Process process) {
+            if (cancelled) {
+                stopProcess(process);
+            } else {
+                this.process = process;
+            }
+        }
+
+        private synchronized void detachProcess(Process process) {
+            if (this.process == process) {
+                this.process = null;
+            }
+        }
+
+        private void cancel() {
+            HttpURLConnection activeConnection;
+            Process activeProcess;
+            synchronized (this) {
+                cancelled = true;
+                activeConnection = connection;
+                activeProcess = process;
+            }
+            if (activeConnection != null) {
+                activeConnection.disconnect();
+            }
+            if (activeProcess != null) {
+                stopProcess(activeProcess);
+            }
+            thread.interrupt();
+        }
+
+        private static void stopProcess(Process process) {
+            process.descendants().forEach(ProcessHandle::destroyForcibly);
+            process.destroyForcibly();
+        }
+    }
+
+    private static ReentrantLock[] createPlayLocks() {
+        ReentrantLock[] locks = new ReentrantLock[PLAY_LOCK_COUNT];
+        for (int i = 0; i < locks.length; i++) {
+            locks[i] = new ReentrantLock();
+        }
+        return locks;
+    }
+
     // ========== 配置内部类（优先级 2） ==========
     private static class BiliConfig {
         String cacheDir = DEFAULT_CACHE_DIR;
         String serveUrl;
-        Integer port = 8090;
         long cleanupInterval = 60L;
         String ffmpegPath = "ffmpeg";
         int maxAudioLength = 45;
@@ -99,7 +169,7 @@ public class BiliMusicApi implements IMusicApi {
 
         static class Advanced {
             boolean debug = false;
-            String[] listenAddresses = {"0.0.0.0"};
+            Http http = new Http();
             long preserveMinutes = 5L;
             String streamMode = DEFAULT_STREAM_MODE;
             long transcodeMinTimeoutSeconds = DEFAULT_TRANSCODE_MIN_TIMEOUT_SECONDS;
@@ -107,6 +177,12 @@ public class BiliMusicApi implements IMusicApi {
             int maxRetry = 3;
             long retryDelay = 1500L;
             String userAgent = DEFAULT_USER_AGENT;
+        }
+
+        static class Http {
+            boolean enabled = true;
+            Integer port = 8090;
+            String[] listenAddresses = {"0.0.0.0"};
         }
 
     }
@@ -149,7 +225,7 @@ public class BiliMusicApi implements IMusicApi {
             }
         }
         if (addresses.isEmpty()) {
-            AllMusic.log.data("<light_purple>[BiliAPI]<yellow>advanced.listenAddresses 未配置，已回退到 0.0.0.0");
+            AllMusic.log.data("<light_purple>[BiliAPI]<yellow>advanced.http.listenAddresses 未配置，已回退到 0.0.0.0");
             addresses.add("0.0.0.0");
         }
         return new ArrayList<>(addresses);
@@ -165,7 +241,6 @@ public class BiliMusicApi implements IMusicApi {
         JsonObject config = new JsonObject();
         config.addProperty("cacheDir", DEFAULT_CACHE_DIR);
         config.addProperty("serveUrl", "");
-        config.addProperty("port", 8090);
         config.addProperty("cleanupInterval", 60);
         config.addProperty("ffmpegPath", "ffmpeg");
         config.addProperty("maxAudioLength", 45);
@@ -180,9 +255,13 @@ public class BiliMusicApi implements IMusicApi {
         advanced.addProperty("streamMode", DEFAULT_STREAM_MODE);
         advanced.addProperty("transcodeMinTimeoutSeconds", DEFAULT_TRANSCODE_MIN_TIMEOUT_SECONDS);
         advanced.addProperty("transcodeDurationMultiplier", DEFAULT_TRANSCODE_DURATION_MULTIPLIER);
+        JsonObject http = new JsonObject();
+        http.addProperty("enabled", true);
+        http.addProperty("port", 8090);
         JsonArray listenAddresses = new JsonArray();
         listenAddresses.add("0.0.0.0");
-        advanced.add("listenAddresses", listenAddresses);
+        http.add("listenAddresses", listenAddresses);
+        advanced.add("http", http);
         advanced.addProperty("preserveMinutes", 5);
         advanced.addProperty("userAgent", DEFAULT_USER_AGENT);
         config.add("advanced", advanced);
@@ -203,25 +282,63 @@ public class BiliMusicApi implements IMusicApi {
         return changed;
     }
 
-    private boolean isPreviousDefault(JsonObject config, String key, double expectedValue) {
-        if (!config.has(key) || !config.get(key).isJsonPrimitive()
-                || !config.getAsJsonPrimitive(key).isNumber()) {
-            return false;
+    private boolean migrateHttpConfig(JsonObject config) {
+        JsonObject advanced = config.has("advanced") && config.get("advanced").isJsonObject()
+                ? config.getAsJsonObject("advanced") : new JsonObject();
+        config.add("advanced", advanced);
+        JsonObject http = advanced.has("http") && advanced.get("http").isJsonObject()
+                ? advanced.getAsJsonObject("http") : new JsonObject();
+        advanced.add("http", http);
+
+        boolean changed = false;
+        if (config.has("port")) {
+            if (!http.has("port")) {
+                http.add("port", config.get("port").deepCopy());
+            }
+            config.remove("port");
+            changed = true;
         }
-        return Double.compare(config.get(key).getAsDouble(), expectedValue) == 0;
+        if (advanced.has("httpServerEnabled")) {
+            if (!http.has("enabled")) {
+                http.add("enabled", advanced.get("httpServerEnabled").deepCopy());
+            }
+            advanced.remove("httpServerEnabled");
+            changed = true;
+        }
+        if (advanced.has("listenAddresses")) {
+            if (!http.has("listenAddresses")) {
+                http.add("listenAddresses", advanced.get("listenAddresses").deepCopy());
+            }
+            advanced.remove("listenAddresses");
+            changed = true;
+        }
+        return changed;
     }
 
     // ========== IMusicApi 接口方法 ==========
 
     @Override
-    public void reload(File path) {
-        stopCacheCleanup();
+    public synchronized void reload(File path) {
+        List<ActivePlayTask> tasksToCancel;
+        synchronized (lifecycleLock) {
+            reloading = true;
+            configValid = false;
+            tasksToCancel = new ArrayList<>(activePlayTasks);
+        }
+        tasksToCancel.forEach(ActivePlayTask::cancel);
+
+        boolean cleanupStopped = stopCacheCleanup();
+        boolean tasksStopped = awaitPlayTasksStopped();
+        boolean serverStopped = true;
         if (fileServer != null) {
-            fileServer.stop();
-            fileServer = null;
+            serverStopped = fileServer.stop();
+            if (serverStopped) fileServer = null;
+        }
+        if (!cleanupStopped || !tasksStopped || !serverStopped) {
+            AllMusic.log.data("<light_purple>[BiliAPI]<red>旧任务或服务未能完全停止，已取消本次重载；API 保持禁用");
+            return;
         }
         configFile = new File(path, "bili.json");
-        configValid = false;
 
         JsonObject configJson = null;
         boolean configNeedsUpdate = false;
@@ -245,24 +362,15 @@ public class BiliMusicApi implements IMusicApi {
                         && advancedJson.get("configVersion").isJsonPrimitive()
                         && advancedJson.getAsJsonPrimitive("configVersion").isNumber()
                         ? advancedJson.get("configVersion").getAsInt() : -1;
-                if (configVersion == PREVIOUS_CONFIG_VERSION && advancedJson != null
-                        && isPreviousDefault(advancedJson, "transcodeMinTimeoutSeconds",
-                        PREVIOUS_DEFAULT_TRANSCODE_MIN_TIMEOUT_SECONDS)
-                        && isPreviousDefault(advancedJson, "transcodeDurationMultiplier",
-                        PREVIOUS_DEFAULT_TRANSCODE_DURATION_MULTIPLIER)) {
-                    advancedJson.addProperty("transcodeMinTimeoutSeconds",
-                            DEFAULT_TRANSCODE_MIN_TIMEOUT_SECONDS);
-                    advancedJson.addProperty("transcodeDurationMultiplier",
-                            DEFAULT_TRANSCODE_DURATION_MULTIPLIER);
-                    configNeedsUpdate = true;
-                }
+                configNeedsUpdate |= migrateHttpConfig(configJson);
                 if (configVersion != CONFIG_VERSION) {
                     AllMusic.log.data("<light_purple>[BiliAPI]<yellow>检测到配置版本 "
                             + configVersion + "，当前版本为 " + CONFIG_VERSION + "，开始检查缺失配置项");
-                    configNeedsUpdate = mergeMissingConfig(configJson, createDefaultConfigJson());
+                    configNeedsUpdate |= mergeMissingConfig(configJson, createDefaultConfigJson());
                     configJson.getAsJsonObject("advanced").addProperty("configVersion", CONFIG_VERSION);
                     configNeedsUpdate = true;
                 }
+                configNeedsUpdate |= mergeMissingConfig(configJson, createDefaultConfigJson());
                 if (configJson.has("configVersion")) {
                     configJson.remove("configVersion");
                     configNeedsUpdate = true;
@@ -293,10 +401,15 @@ public class BiliMusicApi implements IMusicApi {
                 ? cleanPath(loadedConfig.cacheDir) : DEFAULT_CACHE_DIR;
         if (cacheDir == null || cacheDir.isEmpty()) cacheDir = DEFAULT_CACHE_DIR;
 
-        port = (loadedConfig.port != null && loadedConfig.port > 0 && loadedConfig.port <= 65535)
-                ? loadedConfig.port : 8090;
-        if (loadedConfig.port == null || loadedConfig.port != port) {
-            AllMusic.log.data("<light_purple>[BiliAPI]<yellow>port 无效（" + loadedConfig.port
+        if (loadedConfig.advanced.http == null) {
+            loadedConfig.advanced.http = new BiliConfig.Http();
+        }
+        port = (loadedConfig.advanced.http.port != null
+                && loadedConfig.advanced.http.port > 0 && loadedConfig.advanced.http.port <= 65535)
+                ? loadedConfig.advanced.http.port : 8090;
+        if (loadedConfig.advanced.http.port == null || loadedConfig.advanced.http.port != port) {
+            AllMusic.log.data("<light_purple>[BiliAPI]<yellow>advanced.http.port 无效（"
+                    + loadedConfig.advanced.http.port
                     + "），已回退到 8090");
         }
 
@@ -338,10 +451,11 @@ public class BiliMusicApi implements IMusicApi {
         maxRetry = (loadedConfig.advanced.maxRetry > 0) ? loadedConfig.advanced.maxRetry : 3;
         retryDelay = (loadedConfig.advanced.retryDelay > 0) ? loadedConfig.advanced.retryDelay : 1500L;
         debugEnabled = loadedConfig.advanced.debug;
+        httpServerEnabled = loadedConfig.advanced.http.enabled;
         userAgent = (loadedConfig.advanced.userAgent != null && !loadedConfig.advanced.userAgent.isEmpty())
                 ? cleanPath(loadedConfig.advanced.userAgent) : DEFAULT_USER_AGENT;
         if (userAgent == null || userAgent.isEmpty()) userAgent = DEFAULT_USER_AGENT;
-        listenAddresses = normalizeListenAddresses(loadedConfig.advanced.listenAddresses);
+        listenAddresses = normalizeListenAddresses(loadedConfig.advanced.http.listenAddresses);
         preserveMinutes = loadedConfig.advanced.preserveMinutes >= 0
                 ? loadedConfig.advanced.preserveMinutes : 5L;
         if (loadedConfig.advanced.preserveMinutes < 0) {
@@ -376,14 +490,16 @@ public class BiliMusicApi implements IMusicApi {
         // ---- 检查依赖 ----
         boolean ffmpegOk = checkFfmpeg();
         boolean dirOk = ensureCacheDirectory();
-        boolean fileServerOk = false;
+        boolean fileServerOk = !httpServerEnabled;
         if (dirOk) {
+            cleanupCache(effectiveCachePath);
+        }
+        if (httpServerEnabled && serveUrl != null && ffmpegOk && dirOk) {
             fileServer = new BiliHttpServer(effectiveCachePath, port, listenAddresses, this::debugLog);
             fileServerOk = fileServer.start();
             if (!fileServerOk) {
                 fileServer = null;
             }
-            cleanupCache(effectiveCachePath);
         }
 
         if (serveUrl != null && ffmpegOk && dirOk && fileServerOk) {
@@ -393,8 +509,13 @@ public class BiliMusicApi implements IMusicApi {
             debugLog("配置加载完成：缓存目录=" + effectiveCachePath.toAbsolutePath()
                     + "，serveUrl=" + serveUrl + "，ffmpeg=" + ffmpegPath
                     + "，port=" + port + "，quality=" + quality
-                    + "，streamMode=" + streamMode + "，debug=" + debugEnabled);
-            debugLog("HTTP 监听地址：" + String.join(", ", listenAddresses));
+                    + "，streamMode=" + streamMode + "，httpServerEnabled=" + httpServerEnabled
+                    + "，debug=" + debugEnabled);
+            if (httpServerEnabled) {
+                debugLog("HTTP 监听地址：" + String.join(", ", listenAddresses));
+            } else {
+                debugLog("内置 HTTP 服务已禁用，使用外部 HTTP 服务提供缓存文件");
+            }
             if (maxAudioLength > 0) {
                 debugLog("最大音频时长限制：" + maxAudioLength + " 分钟");
             } else {
@@ -416,7 +537,7 @@ public class BiliMusicApi implements IMusicApi {
             if (!dirOk) {
                 AllMusic.log.data("<light_purple>[BiliAPI]<red>缓存目录不可用，API 禁用");
             }
-            if (!fileServerOk) {
+            if (httpServerEnabled && !fileServerOk) {
                 AllMusic.log.data("<light_purple>[BiliAPI]<red>HTTP 文件服务启动失败，API 禁用");
             }
         }
@@ -463,6 +584,9 @@ public class BiliMusicApi implements IMusicApi {
 
         if (!configValid && !configBroken) {
             AllMusic.log.data("<light_purple>[BiliAPI]<red>B站API加载失败：请检查日志中的错误原因");
+        }
+        synchronized (lifecycleLock) {
+            reloading = false;
         }
     }
 
@@ -616,7 +740,10 @@ public class BiliMusicApi implements IMusicApi {
     }
 
     private void startCacheCleanup() {
-        stopCacheCleanup();
+        if (!stopCacheCleanup()) {
+            AllMusic.log.data("<light_purple>[BiliAPI]<red>旧缓存清理任务尚未退出，无法启动新的清理任务");
+            return;
+        }
         cleanupExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread thread = new Thread(r, "bili-cache-cleanup");
             thread.setDaemon(true);
@@ -628,11 +755,47 @@ public class BiliMusicApi implements IMusicApi {
         debugLog("已启动缓存定时清理，间隔 " + interval + " 分钟，保留最近 " + preserveMinutes + " 分钟文件");
     }
 
-    private void stopCacheCleanup() {
-        if (cleanupExecutor != null) {
-            cleanupExecutor.shutdownNow();
-            cleanupExecutor = null;
+    private boolean stopCacheCleanup() {
+        ScheduledExecutorService executor = cleanupExecutor;
+        if (executor == null) {
+            return true;
         }
+        executor.shutdownNow();
+        try {
+            if (!executor.awaitTermination(SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                AllMusic.log.data("<light_purple>[BiliAPI]<red>缓存清理线程未能在强制关闭后退出");
+                return false;
+            }
+            cleanupExecutor = null;
+            return true;
+        } catch (InterruptedException e) {
+            executor.shutdownNow();
+            Thread.currentThread().interrupt();
+            AllMusic.log.data("<light_purple>[BiliAPI]<red>等待缓存清理线程停止时被中断：" + e);
+            return false;
+        }
+    }
+
+    private boolean awaitPlayTasksStopped() {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(SHUTDOWN_TIMEOUT_SECONDS);
+        synchronized (lifecycleLock) {
+            while (!activePlayTasks.isEmpty()) {
+                long remaining = deadline - System.nanoTime();
+                if (remaining <= 0) {
+                    AllMusic.log.data("<light_purple>[BiliAPI]<red>播放任务未能在 "
+                            + SHUTDOWN_TIMEOUT_SECONDS + " 秒内退出，取消本次重载");
+                    return false;
+                }
+                try {
+                    TimeUnit.NANOSECONDS.timedWait(lifecycleLock, remaining);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    AllMusic.log.data("<light_purple>[BiliAPI]<red>等待播放任务停止时被中断：" + e);
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     private void cleanupCache(Path cachePath) {
@@ -704,7 +867,9 @@ public class BiliMusicApi implements IMusicApi {
 
     @Override
     public boolean isBusy() {
-        return isUpdate;
+        synchronized (lifecycleLock) {
+            return !activePlayTasks.isEmpty();
+        }
     }
 
     @Override
@@ -723,7 +888,7 @@ public class BiliMusicApi implements IMusicApi {
 
     @Override
     public boolean checkId(String id) {
-        return id != null && id.startsWith("BV");
+        return id != null && id.matches("BV[A-Za-z0-9]{10}");
     }
 
     @Override
@@ -810,20 +975,59 @@ public class BiliMusicApi implements IMusicApi {
 
     @Override
     public String getPlayUrl(String id) {
-        if (!configValid) {
-            AllMusic.log.data("<light_purple>[BiliAPI]<red>API 未正确配置，拒绝生成播放链接");
-            return null;
-        }
         if (!checkId(id)) {
             AllMusic.log.data("<light_purple>[BiliAPI]<red>无效BV号：" + id);
             return null;
         }
 
+        ActivePlayTask task = new ActivePlayTask();
+        synchronized (lifecycleLock) {
+            if (!configValid || reloading) {
+                AllMusic.log.data("<light_purple>[BiliAPI]<red>API 未正确配置或正在重载，拒绝生成播放链接");
+                return null;
+            }
+            activePlayTasks.add(task);
+        }
+
+        currentPlayTask.set(task);
+        ReentrantLock playLock = playLocks[Math.floorMod(id.hashCode(), playLocks.length)];
+        boolean lockAcquired = false;
+        try {
+            playLock.lockInterruptibly();
+            lockAcquired = true;
+            if (task.cancelled) {
+                return null;
+            }
+            return generatePlayUrl(id, task);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            if (!task.cancelled) {
+                AllMusic.log.data("<light_purple>[BiliAPI]<red>等待播放任务锁时被中断：" + e);
+            }
+            return null;
+        } finally {
+            if (lockAcquired) {
+                playLock.unlock();
+            }
+            currentPlayTask.remove();
+            synchronized (lifecycleLock) {
+                activePlayTasks.remove(task);
+                lifecycleLock.notifyAll();
+            }
+        }
+    }
+
+    private String generatePlayUrl(String id, ActivePlayTask task) {
         Path cachePath = getCachePath();
         String mp3Name = id + ".mp3";
         Path mp3File = cachePath.resolve(mp3Name);
+        if (!mp3File.normalize().startsWith(cachePath)) {
+            AllMusic.log.data("<light_purple>[BiliAPI]<red>缓存文件路径超出缓存目录：" + mp3File);
+            return null;
+        }
         Path inputFile = cachePath.resolve(streamMode.equals("dash")
                 ? id + ".dash.m4a.tmp" : id + ".mp4.tmp");
+        Path outMp3 = cachePath.resolve(id + ".out.mp3");
 
         try {
             if (Files.exists(mp3File) && Files.size(mp3File) > 1000) {
@@ -831,22 +1035,23 @@ public class BiliMusicApi implements IMusicApi {
                 return serveUrl + mp3Name;
             }
 
+            if (task.cancelled) return null;
             debugLog("开始生成音频：" + id);
             VideoMetadata metadata = fetchVideoMetadata(id);
             if (metadata == null) {
                 AllMusic.log.data("<light_purple>[BiliAPI]<red>无法获取视频CID和时长：" + id);
                 return null;
             }
+            if (task.cancelled) return null;
 
-            Path outMp3 = cachePath.resolve(id + ".out.mp3");
             List<String> streamUrls = streamProvider.fetchUrls(id, metadata.cid());
-            if (streamUrls == null || streamUrls.isEmpty()) {
+            if (task.cancelled || streamUrls == null || streamUrls.isEmpty()) {
                 AllMusic.log.data("<light_purple>[BiliAPI]<red>无法获取"
                         + (streamMode.equals("dash") ? "DASH音频" : "视频")
                         + "播放地址：" + id);
                 return null;
             }
-            if (!downloadFirstAvailable(streamUrls, inputFile)) {
+            if (!downloadFirstAvailable(streamUrls, inputFile, task)) {
                 AllMusic.log.data("<light_purple>[BiliAPI]<red>下载"
                         + (streamMode.equals("dash") ? "DASH音频" : "MP4")
                         + "失败：" + id);
@@ -856,12 +1061,12 @@ public class BiliMusicApi implements IMusicApi {
             long timeoutSeconds = calculateTranscodeTimeout(metadata.durationSeconds());
             debugLog("ffmpeg转码超时上限：" + timeoutSeconds + " 秒（视频时长="
                     + metadata.durationSeconds() + " 秒）");
-            if (!convertToMp3(inputFile, outMp3, timeoutSeconds)) {
+            if (task.cancelled || !convertToMp3(inputFile, outMp3, timeoutSeconds, task)) {
                 return null;
             }
 
-            Files.deleteIfExists(mp3File);
-            Files.move(outMp3, mp3File);
+            if (task.cancelled) return null;
+            Files.move(outMp3, mp3File, StandardCopyOption.REPLACE_EXISTING);
             debugLog("音频生成完成：" + mp3File.toAbsolutePath());
             return serveUrl + mp3Name;
 
@@ -1012,8 +1217,16 @@ public class BiliMusicApi implements IMusicApi {
     }
 
     private boolean downloadFile(String url, Path target) {
+        HttpURLConnection conn = null;
         try {
-            HttpURLConnection conn = (HttpURLConnection) URI.create(url).toURL().openConnection();
+            conn = (HttpURLConnection) URI.create(url).toURL().openConnection();
+            ActivePlayTask task = currentPlayTask.get();
+            if (task != null) {
+                task.attachConnection(conn);
+                if (task.cancelled) {
+                    return false;
+                }
+            }
             conn.setRequestMethod("GET");
             conn.setRequestProperty("User-Agent", userAgent);
             conn.setRequestProperty("Referer", "https://www.bilibili.com/");
@@ -1021,6 +1234,9 @@ public class BiliMusicApi implements IMusicApi {
             conn.setReadTimeout(60000);
 
             int code = conn.getResponseCode();
+            if (task != null && task.cancelled) {
+                return false;
+            }
             if (code != 200 && code != 206) {
                 AllMusic.log.data("<light_purple>[BiliAPI]<red>下载失败，HTTP " + code);
                 return false;
@@ -1034,13 +1250,27 @@ public class BiliMusicApi implements IMusicApi {
                     + (success ? Files.size(target) : 0) + " 字节");
             return success;
         } catch (Exception e) {
-            AllMusic.log.data("<light_purple>[BiliAPI]<red>下载文件失败：" + e.toString());
+            ActivePlayTask task = currentPlayTask.get();
+            if (task == null || !task.cancelled) {
+                AllMusic.log.data("<light_purple>[BiliAPI]<red>下载文件失败：" + e.toString());
+            }
             return false;
+        } finally {
+            ActivePlayTask task = currentPlayTask.get();
+            if (conn != null) {
+                if (task != null) {
+                    task.detachConnection(conn);
+                }
+                conn.disconnect();
+            }
         }
     }
 
-    private boolean downloadFirstAvailable(List<String> urls, Path target) {
+    private boolean downloadFirstAvailable(List<String> urls, Path target, ActivePlayTask task) {
         for (int i = 0; i < urls.size(); i++) {
+            if (task.cancelled) {
+                return false;
+            }
             if (downloadFile(urls.get(i), target)) {
                 if (i > 0) {
                     debugLog("DASH主地址下载失败，已使用第 " + (i + 1) + " 个备用地址");
@@ -1060,7 +1290,7 @@ public class BiliMusicApi implements IMusicApi {
         return transcodeMinTimeoutSeconds + scaledTimeout;
     }
 
-    private boolean convertToMp3(Path input, Path output, long timeoutSeconds) {
+    private boolean convertToMp3(Path input, Path output, long timeoutSeconds, ActivePlayTask task) {
         String inputPath = input.toAbsolutePath().toString();
         String outputPath = output.toAbsolutePath().toString();
 
@@ -1076,6 +1306,7 @@ public class BiliMusicApi implements IMusicApi {
         Process process = null;
         try {
             process = pb.start();
+            task.attachProcess(process);
             if (!process.waitFor(timeoutSeconds, TimeUnit.SECONDS)) {
                 process.descendants().forEach(ProcessHandle::destroyForcibly);
                 process.destroyForcibly();
@@ -1095,9 +1326,16 @@ public class BiliMusicApi implements IMusicApi {
             if (process != null && process.isAlive()) {
                 process.descendants().forEach(ProcessHandle::destroyForcibly);
                 process.destroyForcibly();
+                try {
+                    process.waitFor();
+                } catch (InterruptedException interrupted) {
+                    e.addSuppressed(interrupted);
+                }
             }
             Thread.currentThread().interrupt();
-            AllMusic.log.data("<light_purple>[BiliAPI]<red>ffmpeg转码被中断：" + e);
+            if (!task.cancelled) {
+                AllMusic.log.data("<light_purple>[BiliAPI]<red>ffmpeg转码被中断：" + e);
+            }
             return false;
         } catch (Exception e) {
             if (process != null && process.isAlive()) {
@@ -1106,6 +1344,10 @@ public class BiliMusicApi implements IMusicApi {
             }
             AllMusic.log.data("<light_purple>[BiliAPI]<red>ffmpeg执行异常：" + e.toString());
             return false;
+        } finally {
+            if (process != null) {
+                task.detachProcess(process);
+            }
         }
     }
 

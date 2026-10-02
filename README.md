@@ -47,6 +47,7 @@ http://主机:8090/BVxxxx.mp3
 ## 配置提示
 
 - 缓存上限默认 `512 MB`，每 `60` 分钟清理一次；启动和 `/music reload` 时也会清理。
+- `advanced.http.enabled` 默认 `true`；设为 `false` 可禁用内置 HTTP 服务，并使用自己的服务发布缓存 MP3。
 - `advanced.streamMode` 默认 `dash`，可设为 `mp4`。
 - 转码超时为 `transcodeMinTimeoutSeconds + 视频时长秒数 × transcodeDurationMultiplier`，默认 `60 + 时长 × 0.75` 秒。
 - `advanced.configVersion` 由插件维护。版本缺失或不匹配时会补齐缺少的选项，不覆盖已有设置。

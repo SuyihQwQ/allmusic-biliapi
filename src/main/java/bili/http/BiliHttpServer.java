@@ -14,9 +14,13 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
 public final class BiliHttpServer {
+    private static final int SERVER_STOP_DELAY_SECONDS = 5;
+    private static final long EXECUTOR_SHUTDOWN_TIMEOUT_SECONDS = 5;
+
     private final Path root;
     private final int port;
     private final List<String> listenAddresses;
@@ -31,7 +35,11 @@ public final class BiliHttpServer {
         this.debugLogger = debugLogger;
     }
 
-    public boolean start() {
+    public synchronized boolean start() {
+        if (executor != null || !servers.isEmpty()) {
+            AllMusic.log.data("<light_purple>[BiliAPI]<red>HTTP 文件服务仍在运行或停止中，不能重复启动");
+            return false;
+        }
         List<HttpServer> startedServers = new ArrayList<>();
         try {
             executor = Executors.newCachedThreadPool(runnable -> {
@@ -61,15 +69,37 @@ public final class BiliHttpServer {
         }
     }
 
-    public void stop() {
+    public synchronized boolean stop() {
         for (HttpServer server : servers) {
-            server.stop(0);
+            server.stop(SERVER_STOP_DELAY_SECONDS);
         }
         servers.clear();
-        if (executor != null) {
-            executor.shutdownNow();
-            executor = null;
+        if (executor == null) {
+            return true;
         }
+
+        ExecutorService stoppedExecutor = executor;
+        stoppedExecutor.shutdown();
+        try {
+            if (!stoppedExecutor.awaitTermination(
+                    EXECUTOR_SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                stoppedExecutor.shutdownNow();
+                if (!stoppedExecutor.awaitTermination(
+                        EXECUTOR_SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                    AllMusic.log.data("<light_purple>[BiliAPI]<red>HTTP 文件服务请求线程未能在强制关闭后退出");
+                    return false;
+                }
+            }
+            executor = null;
+        } catch (InterruptedException e) {
+            stoppedExecutor.shutdownNow();
+            Thread.currentThread().interrupt();
+            AllMusic.log.data("<light_purple>[BiliAPI]<red>等待 HTTP 文件服务停止时被中断：" + e);
+            return false;
+        }
+
+        debugLogger.accept("HTTP 文件服务已停止，所有请求线程均已退出");
+        return true;
     }
 
     private void serveCachedFile(HttpExchange exchange) {

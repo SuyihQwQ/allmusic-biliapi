@@ -6,16 +6,19 @@
 {
   "cacheDir": "music_cache",
   "serveUrl": "http://your-public-host:8090/",
-  "port": 8090,
   "cleanupInterval": 60,
   "ffmpegPath": "ffmpeg",
   "maxAudioLength": 45,
   "maxCacheSize": 512,
   "quality": 4,
   "advanced": {
-    "configVersion": 3,
+    "configVersion": 4,
     "debug": false,
-    "listenAddresses": ["0.0.0.0"],
+    "http": {
+      "enabled": true,
+      "port": 8090,
+      "listenAddresses": ["0.0.0.0"]
+    },
     "preserveMinutes": 5,
     "streamMode": "dash",
     "transcodeMinTimeoutSeconds": 60,
@@ -32,7 +35,6 @@
 | --- | --- | --- |
 | `serveUrl` | 空 | 客户端访问音频的根地址，必须以 `/` 结尾。未设置时 API 不启用。 |
 | `cacheDir` | `music_cache` | MP3 缓存目录，可使用绝对路径。 |
-| `port` | `8090` | 内置 HTTP 服务端口，范围 `1–65535`；无效值回退为 `8090`。 |
 | `ffmpegPath` | `ffmpeg` | ffmpeg 可执行文件或绝对路径。 |
 | `maxAudioLength` | `45` | 单曲时长上限，单位分钟；`0` 表示不限。 |
 | `maxCacheSize` | `512` | 缓存上限，单位 MB；`0` 表示不限。 |
@@ -43,9 +45,11 @@
 
 | 配置 | 默认值 | 说明 |
 | --- | --- | --- |
-| `configVersion` | `3` | 配置结构版本，由插件维护，不要手动修改。缺失或不匹配时会补齐缺少项，并保留已有值。 |
+| `configVersion` | `4` | 配置结构版本，由插件维护，不要手动修改。缺失或不匹配时会补齐缺少项，并保留已有值。 |
 | `debug` | `false` | 是否输出详细调试日志。 |
-| `listenAddresses` | `["0.0.0.0"]` | HTTP 服务监听地址列表。所有地址共用 `port`。 |
+| `advanced.http.enabled` | `true` | 是否启动内置 HTTP 文件服务。设为 `false` 时需自行提供 `cacheDir` 中的 MP3 文件，并让 `serveUrl` 指向外部服务。 |
+| `advanced.http.port` | `8090` | 内置 HTTP 服务端口，范围 `1–65535`；无效值回退为 `8090`。 |
+| `advanced.http.listenAddresses` | `["0.0.0.0"]` | HTTP 服务监听地址列表。所有地址共用 `advanced.http.port`。 |
 | `preserveMinutes` | `5` | 清理时保留最近修改的 MP3 文件时间，单位分钟。 |
 | `streamMode` | `dash` | `dash` 下载 DASH 音频轨道；`mp4` 使用原有混合 MP4 流程。无效值回退为 `dash`。 |
 | `transcodeMinTimeoutSeconds` | `60` | 转码超时公式中的固定秒数，必须大于 `0`。 |
@@ -70,7 +74,7 @@ transcodeMinTimeoutSeconds + 视频时长秒数 × transcodeDurationMultiplier
 https://music.example.com/
 ```
 
-这适用于将 Cloudflare Tunnel 等外部隧道转发到插件 HTTP 端口的场景。插件自身不提供 HTTPS、反向代理或目录浏览。
+默认由插件内置 HTTP 服务提供缓存文件，可将 Cloudflare Tunnel 等外部隧道转发到插件监听端口。若 `advanced.http.enabled` 设为 `false`，插件不会监听端口；需自行将 `cacheDir` 中生成的 MP3 发布到 `serveUrl` 对应地址。插件自身不提供 HTTPS、反向代理或目录浏览。
 
 仅支持根路径 MP3：
 
