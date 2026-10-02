@@ -3,7 +3,7 @@ plugins {
 }
 
 group = 'bili'
-version = '3.3'
+version = '3.4'
 
 java {
     toolchain {
@@ -28,5 +28,5 @@ tasks.withType(JavaCompile).configureEach {
 }
 
 tasks.jar {
-    archiveFileName = 'biliapi-3.3.jar'
+    archiveFileName = 'biliapi-3.4.jar'
 }
