@@ -5,7 +5,7 @@
 ```json
 {
   "cacheDir": "music_cache",
-  "serveUrl": "http://your-public-host:8090/",
+  "serveUrl": "",
   "cleanupInterval": 60,
   "ffmpegPath": "ffmpeg",
   "maxAudioLength": 45,
@@ -24,10 +24,13 @@
     "transcodeMinTimeoutSeconds": 60,
     "transcodeDurationMultiplier": 0.75,
     "maxRetry": 3,
-    "retryDelay": 1500
+    "retryDelay": 1500,
+    "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
   }
 }
 ```
+
+这是插件生成的默认配置。将 `serveUrl` 改为客户端可访问的音频根地址后，API 才会启用。
 
 ## 基本配置
 
@@ -45,18 +48,18 @@
 
 | 配置 | 默认值 | 说明 |
 | --- | --- | --- |
-| `configVersion` | `4` | 配置结构版本，由插件维护，不要手动修改。缺失或不匹配时会补齐缺少项，并保留已有值。 |
-| `debug` | `false` | 是否输出详细调试日志。 |
+| `advanced.configVersion` | `4` | 配置结构版本，由插件维护，不要手动修改。缺失或不匹配时会补齐缺少项，并保留已有值。 |
+| `advanced.debug` | `false` | 是否输出详细调试日志。 |
 | `advanced.http.enabled` | `true` | 是否启动内置 HTTP 文件服务。设为 `false` 时需自行提供 `cacheDir` 中的 MP3 文件，并让 `serveUrl` 指向外部服务。 |
 | `advanced.http.port` | `8090` | 内置 HTTP 服务端口，范围 `1–65535`；无效值回退为 `8090`。 |
 | `advanced.http.listenAddresses` | `["0.0.0.0"]` | HTTP 服务监听地址列表。所有地址共用 `advanced.http.port`。 |
-| `preserveMinutes` | `5` | 清理时保留最近修改的 MP3 文件时间，单位分钟。 |
-| `streamMode` | `dash` | `dash` 下载 DASH 音频轨道；`mp4` 使用原有混合 MP4 流程。部分云服务环境可能无法通过 DASH 拉流，遇到拉流失败时建议改为 `mp4`。无效值回退为 `dash`。 |
-| `transcodeMinTimeoutSeconds` | `60` | 转码超时公式中的固定秒数，必须大于 `0`。 |
-| `transcodeDurationMultiplier` | `0.75` | 超时公式中的视频时长倍数，必须为有限正数。 |
-| `maxRetry` | `3` | B 站搜索最大尝试次数，必须大于 `0`。 |
-| `retryDelay` | `1500` | 搜索重试间隔，单位毫秒，必须大于 `0`。 |
-| `userAgent` | Chrome UA | 请求 B 站时使用的 User-Agent。 |
+| `advanced.preserveMinutes` | `5` | 清理时保留最近修改的 MP3 文件时间，单位分钟。 |
+| `advanced.streamMode` | `dash` | `dash` 下载 DASH 音频轨道；`mp4` 使用原有混合 MP4 流程。部分云服务环境可能无法通过 DASH 拉流，遇到拉流失败时建议改为 `mp4`。无效值回退为 `dash`。 |
+| `advanced.transcodeMinTimeoutSeconds` | `60` | 转码超时公式中的固定秒数，必须大于 `0`。 |
+| `advanced.transcodeDurationMultiplier` | `0.75` | 超时公式中的视频时长倍数，必须为有限正数。 |
+| `advanced.maxRetry` | `3` | B 站搜索最大尝试次数，必须大于 `0`。 |
+| `advanced.retryDelay` | `1500` | 搜索重试间隔，单位毫秒，必须大于 `0`。 |
+| `advanced.userAgent` | Chrome UA | 请求 B 站时使用的 User-Agent，默认值见上方配置示例。 |
 
 转码超时为：
 
