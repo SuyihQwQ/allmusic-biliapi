@@ -13,10 +13,10 @@
 项目包含编译用的 AllMusic API：`libs/server-4.2.0-all.jar`。构建产物可在兼容的 AllMusic 服务端运行，不要求运行时宿主 API 版本与编译版本相同。
 
 ```bash
-./gradlew clean build
+./gradlew build
 ```
 
-Windows 使用 `gradlew.bat clean build`。将 `build/libs/bili-api-3.0.jar` 放入：
+Windows 使用 `gradlew.bat build`。将 `build/libs/bili-api-3.0.jar` 放入：
 
 ```text
 <server>/plugins/allmusic/api/
