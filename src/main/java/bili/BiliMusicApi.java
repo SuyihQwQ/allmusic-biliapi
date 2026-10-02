@@ -1,5 +1,9 @@
 package bili;
 
+import bili.http.BiliHttpServer;
+import bili.stream.BiliDashStreamProvider;
+import bili.stream.BiliMp4StreamProvider;
+import bili.stream.BiliStreamProvider;
 import com.coloryr.allmusic.libs.org.apache.hc.client5.http.classic.methods.HttpGet;
 import com.coloryr.allmusic.libs.org.apache.hc.core5.http.HttpEntity;
 import com.coloryr.allmusic.libs.org.apache.hc.core5.http.io.entity.EntityUtils;
@@ -39,16 +43,23 @@ import java.util.stream.Stream;
 public class BiliMusicApi implements IMusicApi {
 
     private static final String BILI_API_BASE = "https://api.bilibili.com";
-    private static final int CONFIG_VERSION = 2;
+    private static final int CONFIG_VERSION = 3;
+    private static final int PREVIOUS_CONFIG_VERSION = 4;
+    private static final long PREVIOUS_DEFAULT_TRANSCODE_MIN_TIMEOUT_SECONDS = 120L;
+    private static final double PREVIOUS_DEFAULT_TRANSCODE_DURATION_MULTIPLIER = 3.0;
+    private static final long DEFAULT_TRANSCODE_MIN_TIMEOUT_SECONDS = 60L;
+    private static final double DEFAULT_TRANSCODE_DURATION_MULTIPLIER = 0.75;
     private static final String DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
     private static final String DEFAULT_CACHE_DIR = "music_cache";
+    private static final String DEFAULT_STREAM_MODE = "dash";
+    private record VideoMetadata(long cid, long durationSeconds) {}
 
     // 必填项
     private String cacheDir = DEFAULT_CACHE_DIR;
     private String serveUrl = null;
     private int port;
     private long cleanupInterval = 60L;
-    private int quality = 6;
+    private int quality = 4;
 
     // 可选顶层
     private String ffmpegPath = "ffmpeg";
@@ -62,6 +73,10 @@ public class BiliMusicApi implements IMusicApi {
     private boolean debugEnabled;
     private List<String> listenAddresses = List.of("0.0.0.0");
     private long preserveMinutes = 5L;
+    private String streamMode = DEFAULT_STREAM_MODE;
+    private long transcodeMinTimeoutSeconds = DEFAULT_TRANSCODE_MIN_TIMEOUT_SECONDS;
+    private double transcodeDurationMultiplier = DEFAULT_TRANSCODE_DURATION_MULTIPLIER;
+    private BiliStreamProvider streamProvider;
 
     private volatile boolean isUpdate;
     private boolean configValid = false;
@@ -79,13 +94,16 @@ public class BiliMusicApi implements IMusicApi {
         String ffmpegPath = "ffmpeg";
         int maxAudioLength = 45;
         int maxCacheSize = 512;
-        int quality = 6;
+        int quality = 4;
         Advanced advanced = new Advanced();
 
         static class Advanced {
             boolean debug = false;
             String[] listenAddresses = {"0.0.0.0"};
             long preserveMinutes = 5L;
+            String streamMode = DEFAULT_STREAM_MODE;
+            long transcodeMinTimeoutSeconds = DEFAULT_TRANSCODE_MIN_TIMEOUT_SECONDS;
+            double transcodeDurationMultiplier = DEFAULT_TRANSCODE_DURATION_MULTIPLIER;
             int maxRetry = 3;
             long retryDelay = 1500L;
             String userAgent = DEFAULT_USER_AGENT;
@@ -152,13 +170,16 @@ public class BiliMusicApi implements IMusicApi {
         config.addProperty("ffmpegPath", "ffmpeg");
         config.addProperty("maxAudioLength", 45);
         config.addProperty("maxCacheSize", 512);
-        config.addProperty("quality", 6);
+        config.addProperty("quality", 4);
 
         JsonObject advanced = new JsonObject();
         advanced.addProperty("configVersion", CONFIG_VERSION);
         advanced.addProperty("maxRetry", 3);
         advanced.addProperty("retryDelay", 1500);
         advanced.addProperty("debug", false);
+        advanced.addProperty("streamMode", DEFAULT_STREAM_MODE);
+        advanced.addProperty("transcodeMinTimeoutSeconds", DEFAULT_TRANSCODE_MIN_TIMEOUT_SECONDS);
+        advanced.addProperty("transcodeDurationMultiplier", DEFAULT_TRANSCODE_DURATION_MULTIPLIER);
         JsonArray listenAddresses = new JsonArray();
         listenAddresses.add("0.0.0.0");
         advanced.add("listenAddresses", listenAddresses);
@@ -180,6 +201,14 @@ public class BiliMusicApi implements IMusicApi {
             }
         }
         return changed;
+    }
+
+    private boolean isPreviousDefault(JsonObject config, String key, double expectedValue) {
+        if (!config.has(key) || !config.get(key).isJsonPrimitive()
+                || !config.getAsJsonPrimitive(key).isNumber()) {
+            return false;
+        }
+        return Double.compare(config.get(key).getAsDouble(), expectedValue) == 0;
     }
 
     // ========== IMusicApi 接口方法 ==========
@@ -216,6 +245,17 @@ public class BiliMusicApi implements IMusicApi {
                         && advancedJson.get("configVersion").isJsonPrimitive()
                         && advancedJson.getAsJsonPrimitive("configVersion").isNumber()
                         ? advancedJson.get("configVersion").getAsInt() : -1;
+                if (configVersion == PREVIOUS_CONFIG_VERSION && advancedJson != null
+                        && isPreviousDefault(advancedJson, "transcodeMinTimeoutSeconds",
+                        PREVIOUS_DEFAULT_TRANSCODE_MIN_TIMEOUT_SECONDS)
+                        && isPreviousDefault(advancedJson, "transcodeDurationMultiplier",
+                        PREVIOUS_DEFAULT_TRANSCODE_DURATION_MULTIPLIER)) {
+                    advancedJson.addProperty("transcodeMinTimeoutSeconds",
+                            DEFAULT_TRANSCODE_MIN_TIMEOUT_SECONDS);
+                    advancedJson.addProperty("transcodeDurationMultiplier",
+                            DEFAULT_TRANSCODE_DURATION_MULTIPLIER);
+                    configNeedsUpdate = true;
+                }
                 if (configVersion != CONFIG_VERSION) {
                     AllMusic.log.data("<light_purple>[BiliAPI]<yellow>检测到配置版本 "
                             + configVersion + "，当前版本为 " + CONFIG_VERSION + "，开始检查缺失配置项");
@@ -290,9 +330,9 @@ public class BiliMusicApi implements IMusicApi {
             AllMusic.log.data("<light_purple>[BiliAPI]<yellow>maxCacheSize 为负数，已回退到 512 MB");
         }
 
-        quality = (loadedConfig.quality >= 0 && loadedConfig.quality <= 9) ? loadedConfig.quality : 6;
+        quality = (loadedConfig.quality >= 0 && loadedConfig.quality <= 9) ? loadedConfig.quality : 4;
         if (loadedConfig.quality < 0 || loadedConfig.quality > 9) {
-            AllMusic.log.data("<light_purple>[BiliAPI]<yellow>quality 超出 0-9 范围（" + loadedConfig.quality + "），使用默认值 6");
+            AllMusic.log.data("<light_purple>[BiliAPI]<yellow>quality 超出 0-9 范围（" + loadedConfig.quality + "），使用默认值 4");
         }
 
         maxRetry = (loadedConfig.advanced.maxRetry > 0) ? loadedConfig.advanced.maxRetry : 3;
@@ -306,6 +346,31 @@ public class BiliMusicApi implements IMusicApi {
                 ? loadedConfig.advanced.preserveMinutes : 5L;
         if (loadedConfig.advanced.preserveMinutes < 0) {
             AllMusic.log.data("<light_purple>[BiliAPI]<yellow>advanced.preserveMinutes 无效，已回退到 5 分钟");
+        }
+        String configuredStreamMode = loadedConfig.advanced.streamMode;
+        streamMode = configuredStreamMode != null
+                ? configuredStreamMode.trim().toLowerCase(java.util.Locale.ROOT) : DEFAULT_STREAM_MODE;
+        if (!streamMode.equals("mp4") && !streamMode.equals("dash")) {
+            AllMusic.log.data("<light_purple>[BiliAPI]<yellow>advanced.streamMode 无效（"
+                    + configuredStreamMode + "），已回退到 " + DEFAULT_STREAM_MODE);
+            streamMode = DEFAULT_STREAM_MODE;
+        }
+        streamProvider = streamMode.equals("dash")
+                ? new BiliDashStreamProvider(this::httpGet, this::debugLog)
+                : new BiliMp4StreamProvider(this::httpGet);
+        transcodeMinTimeoutSeconds = loadedConfig.advanced.transcodeMinTimeoutSeconds > 0
+                ? loadedConfig.advanced.transcodeMinTimeoutSeconds : DEFAULT_TRANSCODE_MIN_TIMEOUT_SECONDS;
+        if (loadedConfig.advanced.transcodeMinTimeoutSeconds <= 0) {
+            AllMusic.log.data("<light_purple>[BiliAPI]<yellow>advanced.transcodeMinTimeoutSeconds 无效，已回退到 "
+                    + DEFAULT_TRANSCODE_MIN_TIMEOUT_SECONDS + " 秒");
+        }
+        transcodeDurationMultiplier = Double.isFinite(loadedConfig.advanced.transcodeDurationMultiplier)
+                && loadedConfig.advanced.transcodeDurationMultiplier > 0
+                ? loadedConfig.advanced.transcodeDurationMultiplier : DEFAULT_TRANSCODE_DURATION_MULTIPLIER;
+        if (!Double.isFinite(loadedConfig.advanced.transcodeDurationMultiplier)
+                || loadedConfig.advanced.transcodeDurationMultiplier <= 0) {
+            AllMusic.log.data("<light_purple>[BiliAPI]<yellow>advanced.transcodeDurationMultiplier 无效，已回退到 "
+                    + DEFAULT_TRANSCODE_DURATION_MULTIPLIER);
         }
 
         // ---- 检查依赖 ----
@@ -327,7 +392,8 @@ public class BiliMusicApi implements IMusicApi {
             AllMusic.log.data("<light_purple>[BiliAPI]<yellow>B站API已加载");
             debugLog("配置加载完成：缓存目录=" + effectiveCachePath.toAbsolutePath()
                     + "，serveUrl=" + serveUrl + "，ffmpeg=" + ffmpegPath
-                    + "，port=" + port + "，quality=" + quality + "，debug=" + debugEnabled);
+                    + "，port=" + port + "，quality=" + quality
+                    + "，streamMode=" + streamMode + "，debug=" + debugEnabled);
             debugLog("HTTP 监听地址：" + String.join(", ", listenAddresses));
             if (maxAudioLength > 0) {
                 debugLog("最大音频时长限制：" + maxAudioLength + " 分钟");
@@ -756,6 +822,8 @@ public class BiliMusicApi implements IMusicApi {
         Path cachePath = getCachePath();
         String mp3Name = id + ".mp3";
         Path mp3File = cachePath.resolve(mp3Name);
+        Path inputFile = cachePath.resolve(streamMode.equals("dash")
+                ? id + ".dash.m4a.tmp" : id + ".mp4.tmp");
 
         try {
             if (Files.exists(mp3File) && Files.size(mp3File) > 1000) {
@@ -764,28 +832,31 @@ public class BiliMusicApi implements IMusicApi {
             }
 
             debugLog("开始生成音频：" + id);
-            Long cid = fetchCid(id);
-            if (cid == null) {
-                AllMusic.log.data("<light_purple>[BiliAPI]<red>无法获取cid：" + id);
+            VideoMetadata metadata = fetchVideoMetadata(id);
+            if (metadata == null) {
+                AllMusic.log.data("<light_purple>[BiliAPI]<red>无法获取视频CID和时长：" + id);
                 return null;
             }
 
-            String videoUrl = fetchVideoUrl(id, cid);
-            if (videoUrl == null) {
-                AllMusic.log.data("<light_purple>[BiliAPI]<red>无法获取视频播放地址：" + id);
-                return null;
-            }
-
-            Path tmpMp4 = cachePath.resolve(id + ".mp4.tmp");
             Path outMp3 = cachePath.resolve(id + ".out.mp3");
-
-            if (!downloadFile(videoUrl, tmpMp4)) {
-                AllMusic.log.data("<light_purple>[BiliAPI]<red>下载MP4失败：" + id);
+            List<String> streamUrls = streamProvider.fetchUrls(id, metadata.cid());
+            if (streamUrls == null || streamUrls.isEmpty()) {
+                AllMusic.log.data("<light_purple>[BiliAPI]<red>无法获取"
+                        + (streamMode.equals("dash") ? "DASH音频" : "视频")
+                        + "播放地址：" + id);
+                return null;
+            }
+            if (!downloadFirstAvailable(streamUrls, inputFile)) {
+                AllMusic.log.data("<light_purple>[BiliAPI]<red>下载"
+                        + (streamMode.equals("dash") ? "DASH音频" : "MP4")
+                        + "失败：" + id);
                 return null;
             }
 
-            if (!convertToMp3(tmpMp4, outMp3)) {
-                Files.deleteIfExists(tmpMp4);
+            long timeoutSeconds = calculateTranscodeTimeout(metadata.durationSeconds());
+            debugLog("ffmpeg转码超时上限：" + timeoutSeconds + " 秒（视频时长="
+                    + metadata.durationSeconds() + " 秒）");
+            if (!convertToMp3(inputFile, outMp3, timeoutSeconds)) {
                 return null;
             }
 
@@ -798,10 +869,17 @@ public class BiliMusicApi implements IMusicApi {
             AllMusic.log.data("<light_purple>[BiliAPI]<red>处理音频文件时发生IO错误：" + e.toString());
             return null;
         } finally {
-            try {
-                Files.deleteIfExists(cachePath.resolve(id + ".mp4.tmp"));
-                Files.deleteIfExists(cachePath.resolve(id + ".out.mp3"));
-            } catch (IOException ignored) {}
+            deleteTemporaryFile(inputFile);
+            deleteTemporaryFile(cachePath.resolve(id + ".out.mp3"));
+        }
+    }
+
+    private void deleteTemporaryFile(Path file) {
+        try {
+            Files.deleteIfExists(file);
+        } catch (IOException e) {
+            AllMusic.log.data("<light_purple>[BiliAPI]<red>删除转码临时文件失败："
+                    + file.getFileName() + " - " + e);
         }
     }
 
@@ -913,35 +991,24 @@ public class BiliMusicApi implements IMusicApi {
         return url.endsWith("/") ? url : url + "/";
     }
 
-    private Long fetchCid(String bvid) {
+    private VideoMetadata fetchVideoMetadata(String bvid) {
         String url = BILI_API_BASE + "/x/web-interface/view?bvid=" + bvid;
         HttpResObj res = httpGet(url);
         if (res == null || !res.ok) return null;
         try {
             JsonObject root = AllMusic.gson.fromJson(res.data, JsonObject.class);
-            return root.getAsJsonObject("data").get("cid").getAsLong();
+            JsonObject data = root.getAsJsonObject("data");
+            long cid = data.get("cid").getAsLong();
+            long durationSeconds = data.get("duration").getAsLong();
+            if (cid <= 0 || durationSeconds <= 0) {
+                AllMusic.log.data("<light_purple>[BiliAPI]<red>视频CID或时长无效：" + bvid);
+                return null;
+            }
+            return new VideoMetadata(cid, durationSeconds);
         } catch (Exception e) {
-            AllMusic.log.data("<light_purple>[BiliAPI]<red>获取cid失败：" + e.toString());
+            AllMusic.log.data("<light_purple>[BiliAPI]<red>获取视频CID和时长失败：" + e);
             return null;
         }
-    }
-
-    private String fetchVideoUrl(String bvid, long cid) {
-        String url = BILI_API_BASE + "/x/player/playurl?bvid=" + bvid +
-                "&cid=" + cid + "&qn=16&type=mp4&platform=html5";
-        HttpResObj res = httpGet(url);
-        if (res == null || !res.ok) return null;
-        try {
-            JsonObject root = AllMusic.gson.fromJson(res.data, JsonObject.class);
-            if (root.get("code").getAsInt() != 0) return null;
-            JsonArray durl = root.getAsJsonObject("data").getAsJsonArray("durl");
-            if (durl != null && durl.size() > 0) {
-                return durl.get(0).getAsJsonObject().get("url").getAsString();
-            }
-        } catch (Exception e) {
-            AllMusic.log.data("<light_purple>[BiliAPI]<red>解析视频播放地址失败：" + e.toString());
-        }
-        return null;
     }
 
     private boolean downloadFile(String url, Path target) {
@@ -972,7 +1039,28 @@ public class BiliMusicApi implements IMusicApi {
         }
     }
 
-    private boolean convertToMp3(Path input, Path output) {
+    private boolean downloadFirstAvailable(List<String> urls, Path target) {
+        for (int i = 0; i < urls.size(); i++) {
+            if (downloadFile(urls.get(i), target)) {
+                if (i > 0) {
+                    debugLog("DASH主地址下载失败，已使用第 " + (i + 1) + " 个备用地址");
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private long calculateTranscodeTimeout(long durationSeconds) {
+        double durationTimeout = durationSeconds * transcodeDurationMultiplier;
+        if (durationTimeout >= Long.MAX_VALUE - transcodeMinTimeoutSeconds) {
+            return Long.MAX_VALUE;
+        }
+        long scaledTimeout = (long) Math.ceil(durationTimeout);
+        return transcodeMinTimeoutSeconds + scaledTimeout;
+    }
+
+    private boolean convertToMp3(Path input, Path output, long timeoutSeconds) {
         String inputPath = input.toAbsolutePath().toString();
         String outputPath = output.toAbsolutePath().toString();
 
@@ -983,23 +1071,39 @@ public class BiliMusicApi implements IMusicApi {
                 outputPath
         );
         pb.redirectErrorStream(true);
+        pb.redirectOutput(ProcessBuilder.Redirect.DISCARD);
 
+        Process process = null;
         try {
-            Process process = pb.start();
-            try (BufferedReader reader = new BufferedReader(
-                    new InputStreamReader(process.getInputStream()))) {
-                while (reader.readLine() != null) {
-                    // consume output
-                }
+            process = pb.start();
+            if (!process.waitFor(timeoutSeconds, TimeUnit.SECONDS)) {
+                process.descendants().forEach(ProcessHandle::destroyForcibly);
+                process.destroyForcibly();
+                process.waitFor();
+                AllMusic.log.data("<light_purple>[BiliAPI]<red>ffmpeg转码超时，已停止进程："
+                        + timeoutSeconds + " 秒");
+                return false;
             }
-            int exit = process.waitFor();
+            int exit = process.exitValue();
             if (exit == 0 && Files.exists(output) && Files.size(output) > 1000) {
                 return true;
             } else {
                 AllMusic.log.data("<light_purple>[BiliAPI]<red>ffmpeg转码失败，退出码：" + exit);
                 return false;
             }
+        } catch (InterruptedException e) {
+            if (process != null && process.isAlive()) {
+                process.descendants().forEach(ProcessHandle::destroyForcibly);
+                process.destroyForcibly();
+            }
+            Thread.currentThread().interrupt();
+            AllMusic.log.data("<light_purple>[BiliAPI]<red>ffmpeg转码被中断：" + e);
+            return false;
         } catch (Exception e) {
+            if (process != null && process.isAlive()) {
+                process.descendants().forEach(ProcessHandle::destroyForcibly);
+                process.destroyForcibly();
+            }
             AllMusic.log.data("<light_purple>[BiliAPI]<red>ffmpeg执行异常：" + e.toString());
             return false;
         }

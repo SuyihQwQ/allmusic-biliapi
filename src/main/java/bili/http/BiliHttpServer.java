@@ -1,4 +1,4 @@
-package bili;
+package bili.http;
 
 import com.coloryr.allmusic.server.core.AllMusic;
 import com.sun.net.httpserver.HttpExchange;
@@ -16,7 +16,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.function.Consumer;
 
-final class BiliHttpServer {
+public final class BiliHttpServer {
     private final Path root;
     private final int port;
     private final List<String> listenAddresses;
@@ -24,14 +24,14 @@ final class BiliHttpServer {
     private final List<HttpServer> servers = new ArrayList<>();
     private ExecutorService executor;
 
-    BiliHttpServer(Path root, int port, List<String> listenAddresses, Consumer<String> debugLogger) {
+    public BiliHttpServer(Path root, int port, List<String> listenAddresses, Consumer<String> debugLogger) {
         this.root = root.toAbsolutePath().normalize();
         this.port = port;
         this.listenAddresses = List.copyOf(listenAddresses);
         this.debugLogger = debugLogger;
     }
 
-    boolean start() {
+    public boolean start() {
         List<HttpServer> startedServers = new ArrayList<>();
         try {
             executor = Executors.newCachedThreadPool(runnable -> {
@@ -61,7 +61,7 @@ final class BiliHttpServer {
         }
     }
 
-    void stop() {
+    public void stop() {
         for (HttpServer server : servers) {
             server.stop(0);
         }
@@ -80,19 +80,31 @@ final class BiliHttpServer {
             return;
         }
 
+        boolean responseStarted = false;
         try {
             String requestPath = exchange.getRequestURI().getPath();
-            if (requestPath == null || !requestPath.startsWith("/")
-                    || requestPath.length() <= 1
-                    || requestPath.substring(1).contains("/")) {
-                debugLogger.accept("HTTP 文件请求 404：只允许根路径 MP3 文件：" + requestPath);
-                sendEmptyResponse(exchange, 404);
+            if (requestPath == null || !requestPath.startsWith("/")) {
+                debugLogger.accept("HTTP 文件请求 400：请求路径无效：" + requestPath);
+                sendEmptyResponse(exchange, 400);
                 return;
             }
+
+            if (containsTraversalSegment(requestPath)) {
+                debugLogger.accept("HTTP 文件请求 403：拒绝路径穿越：" + requestPath);
+                sendEmptyResponse(exchange, 403);
+                return;
+            }
+
+            if (requestPath.length() <= 1 || requestPath.substring(1).contains("/")) {
+                debugLogger.accept("HTTP 文件请求 403：只允许根路径 MP3 文件：" + requestPath);
+                sendEmptyResponse(exchange, 403);
+                return;
+            }
+
             String fileName = requestPath.substring(1);
-            if (fileName.contains("..") || !fileName.endsWith(".mp3")) {
-                debugLogger.accept("HTTP 文件请求 404：路径不是 MP3 文件：" + requestPath);
-                sendEmptyResponse(exchange, 404);
+            if (!fileName.endsWith(".mp3")) {
+                debugLogger.accept("HTTP 文件请求 403：路径不是 MP3 文件：" + requestPath);
+                sendEmptyResponse(exchange, 403);
                 return;
             }
             Path file = root.resolve(fileName).normalize();
@@ -105,20 +117,39 @@ final class BiliHttpServer {
             long size = Files.size(file);
             exchange.getResponseHeaders().set("Content-Type", "audio/mpeg");
             exchange.getResponseHeaders().set("Cache-Control", "public, max-age=86400");
-            exchange.sendResponseHeaders(200, size);
             if ("GET".equalsIgnoreCase(method)) {
-                try (OutputStream output = exchange.getResponseBody();
-                     InputStream input = Files.newInputStream(file)) {
-                    input.transferTo(output);
+                try (InputStream input = Files.newInputStream(file)) {
+                    exchange.sendResponseHeaders(200, size);
+                    responseStarted = true;
+                    try (OutputStream output = exchange.getResponseBody()) {
+                        input.transferTo(output);
+                    }
                 }
             } else {
+                exchange.getResponseHeaders().set("Content-Length", Long.toString(size));
+                exchange.sendResponseHeaders(200, -1);
+                responseStarted = true;
                 exchange.close();
             }
             debugLogger.accept("HTTP 文件请求：" + file.getFileName() + "，状态码=200");
         } catch (IOException e) {
             debugLogger.accept("HTTP 文件请求失败：" + e);
-            exchange.close();
+            if (responseStarted) {
+                exchange.close();
+            } else {
+                sendEmptyResponse(exchange, 500);
+            }
         }
+    }
+
+    private boolean containsTraversalSegment(String requestPath) {
+        String normalized = requestPath.replace('\\', '/');
+        for (String segment : normalized.split("/")) {
+            if ("..".equals(segment)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void sendEmptyResponse(HttpExchange exchange, int status) {
