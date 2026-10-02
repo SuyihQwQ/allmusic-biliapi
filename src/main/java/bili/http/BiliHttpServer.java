@@ -112,35 +112,8 @@ public final class BiliHttpServer {
 
         boolean responseStarted = false;
         try {
-            String requestPath = exchange.getRequestURI().getPath();
-            if (requestPath == null || !requestPath.startsWith("/")) {
-                debugLogger.accept("HTTP 文件请求 400：请求路径无效：" + requestPath);
-                sendEmptyResponse(exchange, 400);
-                return;
-            }
-
-            if (containsTraversalSegment(requestPath)) {
-                debugLogger.accept("HTTP 文件请求 403：拒绝路径穿越：" + requestPath);
-                sendEmptyResponse(exchange, 403);
-                return;
-            }
-
-            if (requestPath.length() <= 1 || requestPath.substring(1).contains("/")) {
-                debugLogger.accept("HTTP 文件请求 403：只允许根路径 MP3 文件：" + requestPath);
-                sendEmptyResponse(exchange, 403);
-                return;
-            }
-
-            String fileName = requestPath.substring(1);
-            if (!fileName.endsWith(".mp3")) {
-                debugLogger.accept("HTTP 文件请求 403：路径不是 MP3 文件：" + requestPath);
-                sendEmptyResponse(exchange, 403);
-                return;
-            }
-            Path file = root.resolve(fileName).normalize();
-            if (!file.startsWith(root) || !Files.isRegularFile(file)) {
-                debugLogger.accept("HTTP 文件请求 404：文件不存在：" + file);
-                sendEmptyResponse(exchange, 404);
+            Path file = resolveRequestedFile(exchange);
+            if (file == null) {
                 return;
             }
 
@@ -170,6 +143,42 @@ public final class BiliHttpServer {
                 sendEmptyResponse(exchange, 500);
             }
         }
+    }
+
+    private Path resolveRequestedFile(HttpExchange exchange) throws IOException {
+        String requestPath = exchange.getRequestURI().getPath();
+        if (requestPath == null || !requestPath.startsWith("/")) {
+            debugLogger.accept("HTTP 文件请求 400：请求路径无效：" + requestPath);
+            sendEmptyResponse(exchange, 400);
+            return null;
+        }
+
+        if (containsTraversalSegment(requestPath)) {
+            debugLogger.accept("HTTP 文件请求 403：拒绝路径穿越：" + requestPath);
+            sendEmptyResponse(exchange, 403);
+            return null;
+        }
+
+        if (requestPath.length() <= 1 || requestPath.substring(1).contains("/")) {
+            debugLogger.accept("HTTP 文件请求 403：只允许根路径 MP3 文件：" + requestPath);
+            sendEmptyResponse(exchange, 403);
+            return null;
+        }
+
+        String fileName = requestPath.substring(1);
+        if (!fileName.endsWith(".mp3")) {
+            debugLogger.accept("HTTP 文件请求 403：路径不是 MP3 文件：" + requestPath);
+            sendEmptyResponse(exchange, 403);
+            return null;
+        }
+
+        Path file = root.resolve(fileName).normalize();
+        if (!file.startsWith(root) || !Files.isRegularFile(file)) {
+            debugLogger.accept("HTTP 文件请求 404：文件不存在：" + file);
+            sendEmptyResponse(exchange, 404);
+            return null;
+        }
+        return file;
     }
 
     private boolean containsTraversalSegment(String requestPath) {
