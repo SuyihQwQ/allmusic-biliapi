@@ -5,7 +5,7 @@
 ```json
 {
   "cacheDir": "music_cache",
-  "serveUrl": "",
+  "serveUrl": "http://localhost:8090/",
   "cleanupInterval": 60,
   "ffmpegPath": "ffmpeg",
   "maxAudioLength": 45,
@@ -30,13 +30,13 @@
 }
 ```
 
-这是插件生成的默认配置。将 `serveUrl` 改为客户端可访问的音频根地址后，API 才会启用。
+这是插件生成的默认配置。`localhost` 仅适用于客户端与服务器在同一台机器的情况；远程客户端应将 `serveUrl` 改为它们可访问的主机名或 IP。
 
 ## 基本配置
 
 | 配置 | 默认值 | 说明 |
 | --- | --- | --- |
-| `serveUrl` | 空 | 客户端访问音频的根地址，必须以 `/` 结尾。未设置时 API 不启用。 |
+| `serveUrl` | `http://localhost:8090/` | 客户端访问音频的根地址，必须以 `/` 结尾。远程客户端需改为服务器可访问的主机名或 IP。 |
 | `cacheDir` | `music_cache` | MP3 缓存目录，可使用绝对路径。 |
 | `ffmpegPath` | `ffmpeg` | ffmpeg 可执行文件或绝对路径。 |
 | `maxAudioLength` | `45` | 单曲时长上限，单位分钟；`0` 表示不限。 |

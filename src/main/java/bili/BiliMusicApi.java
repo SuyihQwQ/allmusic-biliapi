@@ -240,7 +240,7 @@ public class BiliMusicApi implements IMusicApi {
     private JsonObject createDefaultConfigJson() {
         JsonObject config = new JsonObject();
         config.addProperty("cacheDir", DEFAULT_CACHE_DIR);
-        config.addProperty("serveUrl", "");
+        config.addProperty("serveUrl", "http://localhost:8090/");
         config.addProperty("cleanupInterval", 60);
         config.addProperty("ffmpegPath", "ffmpeg");
         config.addProperty("maxAudioLength", 45);
@@ -567,7 +567,7 @@ public class BiliMusicApi implements IMusicApi {
                 try (FileWriter writer = new FileWriter(configFile)) {
                     writer.write(AllMusic.gson.toJson(defaultConfig));
                 }
-                AllMusic.log.data("<light_purple>[BiliAPI]<yellow>已重新生成 bili.json，请填写 serveUrl 后重载");
+                AllMusic.log.data("<light_purple>[BiliAPI]<yellow>已重新生成 bili.json；如客户端不在本机，请将 serveUrl 改为客户端可访问的地址后重载");
             } catch (Exception e) {
                 AllMusic.log.data("<light_purple>[BiliAPI]<red>重新生成 bili.json 失败：" + e.toString());
             }
