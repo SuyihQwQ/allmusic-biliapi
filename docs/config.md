@@ -51,7 +51,7 @@
 | `advanced.http.port` | `8090` | 内置 HTTP 服务端口，范围 `1–65535`；无效值回退为 `8090`。 |
 | `advanced.http.listenAddresses` | `["0.0.0.0"]` | HTTP 服务监听地址列表。所有地址共用 `advanced.http.port`。 |
 | `preserveMinutes` | `5` | 清理时保留最近修改的 MP3 文件时间，单位分钟。 |
-| `streamMode` | `dash` | `dash` 下载 DASH 音频轨道；`mp4` 使用原有混合 MP4 流程。无效值回退为 `dash`。 |
+| `streamMode` | `dash` | `dash` 下载 DASH 音频轨道；`mp4` 使用原有混合 MP4 流程。部分云服务环境可能无法通过 DASH 拉流，遇到拉流失败时建议改为 `mp4`。无效值回退为 `dash`。 |
 | `transcodeMinTimeoutSeconds` | `60` | 转码超时公式中的固定秒数，必须大于 `0`。 |
 | `transcodeDurationMultiplier` | `0.75` | 超时公式中的视频时长倍数，必须为有限正数。 |
 | `maxRetry` | `3` | B 站搜索最大尝试次数，必须大于 `0`。 |
